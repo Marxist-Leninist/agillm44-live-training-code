@@ -2,12 +2,12 @@
 
 This standalone repository contains the exact, unmodified single-file Python trainer used by the live AGILLM4.4 production process at the verification time below.
 
-- Verified live: 2026-09-06 15:51 UTC (vast.ai RTX 3090, instance 47086549)
-- Live supervisor PID: `3653017`
-- Live trainer PID: `3653107`
-- Source file: `agillm43_singlefile_intelligence_v27_16_6_deepctx_20260906.py`
-- SHA-256: `f7abca9aaef97e7690765f9c7f00e04b65151f700bbb959b5cf053126d21ba0f`
-- Size: 1,937,250 bytes
+- Verified live: 2026-09-06 18:40 UTC (vast.ai RTX 3090, instance 47086549)
+- Live supervisor PID: `3798273`
+- Live trainer PID: `3798343`
+- Source file: `agillm43_singlefile_intelligence_v27_16_8_det50_packet_20260906.py`
+- SHA-256: `2178bdeb5c6f18b89ba169a43ad9d5c0128e48c81d3111a7787ecc41462b9d8a`
+- Size: 1,939,932 bytes
 
 What changed since the previous snapshot (v27.12, 2026-09-04):
 
@@ -16,6 +16,8 @@ What changed since the previous snapshot (v27.12, 2026-09-04):
 - v27.16.4: adaptive vocab chunk in the streaming fused cross-entropy (memory).
 - v27.16.5: fused cross-entropy backward fix. The gradient matmuls ran under an fp16 autocast after pre-scaling (softmax - onehot) by 1/N; with bf16 AMP (no GradScaler) that underflowed most of the softmax tail at large target counts, biasing the hidden-state gradient (measured cosine 0.70-0.79 vs the exact gradient at N~32k). Now the unscaled softmax goes through bf16 matmuls and the 1/N scale is applied in fp32 afterwards (cosine 1.000).
 - v27.16.6: multi-row full-stack SAT/NAT composition anchors. The NAT anchor had been one 128-token crop (64 masked targets) every third step at weight <= 0.10 against the AR anchor's 32,752 targets every step, and the full held-out NAT metrics regressed while AR improved; the NAT/SAT anchors can now batch several crops per call (hot ints `dblock_fullstack_nat_rows` / `dblock_fullstack_sat_rows`) and the SAT/NAT weight ceiling is hot-configurable (`dblock_fullstack_aux_weight_max`). Live hot config: NAT 16 crops every step at weight 1.0, SAT 16 crops, AR anchor weight 2.0.
+- v27.16.7 (another agent, 16:22 UTC): detachable-50M teacher-packet overlay only — a masked NAT capture no longer erases a clean packet emitted earlier in the same mature commit (under v27.16.6 the NAT anchor, now running every step with masked ids, had discarded every packet, so the detachable-50M student trained on no steps at all). Mature-model training semantics unchanged.
+- v27.16.8 (18:19 UTC, live): detachable-50M teacher-packet fix, overlay literals only. Every remaining student error (`AR mature teacher-logit contract is invalid`, 101/101) fell on the SAT-anchor steps: the overlay re-emitted a packet from the 16-crop SAT capture without slicing to the student's batch (anchor_ids [16,128], teacher_logits [16,64,V]) and that packet replaced the canonical 1-row AR packet; the consumer caps ids at `schedule["batch"]` (1) but not the teacher logits, so `size(0)` 16 != 1. Now (1) a SAT/NAT capture never replaces a current, clean, valid packet (AR-packet precedence), (2) SAT/NAT packets are sliced to the student rows before the logits are computed, (3) the consumer caps `_active_teacher_logits` to the same rows. Verified live: 0 student errors and AR-student commits on every step residue over the first 67 steps (previously error_skipped on every third step). The `AGILLM_SINGLEFILE_MANIFEST` literal is intentionally unchanged (pinned derivation proof); the folded overlay sources are the `_AGILLM_SF_SOURCE` string literals after the `# Folded module:` markers.
 
 ### How the live process is launched (exact command lines, environment, hot config, LR override)
 
@@ -606,6 +608,8 @@ Effective LR = `max(schedule, lr × clamp((seen_tok − since_seen_tok) / ramp_t
 Fields of the file (current contents, governor-managed): `lr`, `ramp_tokens`, `since_seen_tok`, `phase` = `short_ramp_then_hold`, `stage` = `owner_lr_fix_v2_after_rollback`, `owner_directed` = true, plus the governor block (`cap` 2e-05, `floor` 1e-06).
 
 </details>
+
+The live v27.16.8 process was launched 2026-09-06 18:19 UTC with the identical environment and flags, the trainer file swapped to `agillm43_singlefile_intelligence_v27_16_8_det50_packet_20260906.py`, `--resume` pointing at the derived package `pretrain_step02787566_deepctx_v27168_c0e8ba7500480fe2.pt` (step 2787566, exact optimizer-state resume, `--data_seed 2787608`).
 
 The checkpoint trained by these two launches is published as `checkpoints/step2787024_20260906/` in [MarxistLeninist/AGILLM-4.3-checkpoints](https://huggingface.co/MarxistLeninist/AGILLM-4.3-checkpoints), whose README carries the held-out results and a plain-language summary of every flag group.
 
