@@ -150,19 +150,32 @@ DiffusionBlocks 'process in chunks, don't hold the whole thing' idea applied to
 the output head instead of network depth."""
 import torch
 
+def _fused_ce_logit_dtype(t):
+    # Logits: fp16 on CUDA (the pre-v27.16.5 numerics: autocast default dtype), fp32 elsewhere.
+    return torch.float16 if t.is_cuda else torch.float32
+
+
+def _fused_ce_grad_dtype(t):
+    # Gradient matmuls: bf16 on CUDA. Same tensor-core throughput as fp16 but the fp32 exponent
+    # range, so the (softmax - onehot) tail never underflows; rounding is unbiased.
+    return torch.bfloat16 if t.is_cuda else torch.float32
+
+
 class FusedCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, W, tgt, vchunk=16384):
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast("cuda", enabled=False):
             hf = h.float()
             Wf = W.float()
             N, d = h.shape
             V = W.shape[0]
+            ldt = _fused_ce_logit_dtype(h)
+            hl = hf.to(ldt)
             m = torch.full((N,), -1e30, device=h.device, dtype=torch.float32)
             s = torch.zeros(N, device=h.device, dtype=torch.float32)
             zt = torch.zeros(N, device=h.device, dtype=torch.float32)
             for c in range(0, V, vchunk):
-                lg = hf @ Wf[c:c+vchunk].T                    # [N,vchunk] transient only
+                lg = hl @ Wf[c:c+vchunk].to(ldt).T             # [N,vchunk] transient only
                 cm = lg.max(1).values
                 nm = torch.maximum(m, cm)
                 s = s * torch.exp(m - nm) + torch.exp(lg - nm[:, None]).sum(1)
@@ -181,28 +194,54 @@ class FusedCE(torch.autograd.Function):
         vc = ctx.vchunk
         N, d = h.shape
         V = W.shape[0]
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast("cuda", enabled=False):
             hf = h.float()
             Wc_all = W.float()
+            ldt = _fused_ce_logit_dtype(h)
+            gdt = _fused_ce_grad_dtype(h)
+            hl = hf.to(ldt)
+            hg = hf.to(gdt)
             gh = torch.zeros_like(hf)
-            gW = torch.zeros(W.shape, device=W.device, dtype=torch.float32)
-            
+            gW = (torch.zeros(W.shape, device=W.device, dtype=torch.float32)
+                  if ctx.needs_input_grad[1] else None)
+
             # Forward returns ordinary mean cross-entropy, so backward must be
             # the exact ordinary CE gradient. The former hidden focal-gamma scale
             # made the reported loss and optimized objective disagree.
             sc = go.to(dtype=torch.float32) / N
-            
+
             for c in range(0, V, vc):
                 Wc = Wc_all[c:c+vc]
-                p = torch.exp(hf @ Wc.T - lse[:, None])     # softmax chunk [N,vchunk]
+                lg = hl @ Wc.to(ldt).T                          # same logits as forward
+                p = torch.exp(lg.float() - lse[:, None])        # softmax chunk [N,vchunk], fp32
                 ic = (tgt >= c) & (tgt < c+vc)
                 p[ic, tgt[ic] - c] -= 1.0
-                p *= sc
-                gh += p @ Wc
-                gW[c:c+vc] += p.T @ hf
-            return gh.to(h.dtype), gW.to(W.dtype), None, None
+                # v27.16.5 FIX: (softmax - onehot) goes through the half-precision matmul
+                # UNSCALED (entries in [-1, 1]); the go/N scale is applied in fp32 below.
+                # Pre-fix this multiplied by go/N first and ran the matmul under fp16
+                # autocast, so with bf16 AMP (no GradScaler) every softmax entry below
+                # ~N*6e-8 underflowed to zero: at N=32752 that removed 60-90% of the
+                # softmax mass (129k vocab, CE~7) from the hidden-state gradient
+                # (cos 0.70-0.79 vs exact), a systematic bias that raised held-out CE
+                # linearly with cumulative LR. Measured post-fix: cos 1.000, rel err ~1%.
+                pg = p.to(gdt)
+                Wg = Wc.to(gdt)
+                gh += (pg @ Wg).float()
+                if gW is not None:
+                    gW[c:c+vc] += (pg.T @ hg).float()
+            gh *= sc
+            if gW is not None:
+                gW *= sc
+            return gh.to(h.dtype), (None if gW is None else gW.to(W.dtype)), None, None
 
 def fused_ce(h, W, tgt, vchunk=16384):
+    # v27.16.4: the streaming CE holds fp32 [N, vchunk] transients (logits and
+    # their exp) per vocab chunk. Above 8192 target rows (the multi-row
+    # full-stack anchor) shrink the chunk so those transients stay ~0.5GB
+    # instead of ~4-8GB; the FLOPs and the online log-sum-exp are unchanged.
+    n_rows = int(h.numel() // h.size(-1)) if h.numel() else 0
+    if n_rows > 8192:
+        vchunk = min(int(vchunk), 4096)
     return FusedCE.apply(h.reshape(-1, h.size(-1)), W, tgt.reshape(-1), vchunk)
 
 # ===== END fused_ce.py =====
@@ -456,6 +495,25 @@ class _DblockLearnedRouter(nn.Module):
 
 
 _DBLOCK_ROUTER_CHECKPOINT_SCHEMA = "agillm43.dblock.router.shadow.v1"
+_DBLOCK_TARGET_ROUTE_SCHEMA = "agillm43.dblock.target-route.xor-fold56.v2"
+_DBLOCK_TARGET_ROUTE_POLICY_ID = "xor-fold56-v1"
+_DBLOCK_TARGET_ROUTE_POLICY_VERSION = 1
+_DBLOCK_TARGET_ROUTE_PARENT_RUNTIME_SHA256 = (
+    "643c688a9e28e2bd78531c6b6285daa76c8a3e08e67d46d992ea412609e12f09"
+)
+_DBLOCK_TARGET_ROUTE_DESCRIPTOR = (
+    '{"block_formula":"k=t%14; block=2*k if k<7 else 27-2*k",'
+    '"blocks":14,"clock":"successful_optimizer_commits_since_activation",'
+    '"id":"xor-fold56-v1","period":56,'
+    '"phase_encoding":["layer0-attn","layer1-attn","layer0-ffn","layer1-ffn"],'
+    '"phase_formula":"q=(t//14)&3; phase=q^bitreverse2(k%4)",'
+    '"physical_layers_per_block":2,"sublayers":["attn","ffn"]}'
+)
+_DBLOCK_TARGET_ROUTE_POLICY_SHA256 = (
+    "650f61343ead9636c600bf435ec9c915cd2a1ce0730cef7db27e1459d9e27ee2"
+)
+_DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256 = None
+_DBLOCK_TARGET_ROUTE_TARGET_MAP_CACHE = {}
 
 
 def _dblock_router_mode(args):
@@ -1428,6 +1486,624 @@ def _dblock_json_copy(value):
     """Return a finite, JSON-only copy suitable for checkpoint metadata."""
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return json.loads(raw)
+
+
+def _dblock_target_route_policy(args):
+    return str(getattr(args, "dblock_target_route_policy", "legacy") or "legacy").lower()
+
+
+def _dblock_target_route_controller_source_sha256():
+    """Hash the controller source loaded for this process, without self-reference."""
+    global _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256
+    if _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256 is None:
+        source_path = pathlib.Path(__file__).resolve()
+        digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError("target-route controller source SHA-256 is invalid")
+        _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256 = digest
+    return _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256
+
+
+def _dblock_target_route_validate_legacy_activation(args, checkpoint_step):
+    """Authorize the single legacy-to-XOR transition against one pointer record."""
+    if int(getattr(args, "dblock_target_route_activate_from_checkpoint", 0) or 0) != 1:
+        raise ValueError(
+            "legacy continuation requires "
+            "--dblock_target_route_activate_from_checkpoint 1"
+        )
+    expected_step = int(
+        getattr(args, "dblock_target_route_activation_checkpoint_step", -1)
+    )
+    loaded_step = _dblock_require_exact_int(
+        checkpoint_step, "target-route loaded checkpoint step", minimum=0
+    )
+    if expected_step < 0 or loaded_step != expected_step:
+        raise ValueError(
+            "legacy XOR-FOLD56 activation checkpoint step does not match its "
+            "explicit one-time binding"
+        )
+    expected_pointer = str(
+        getattr(
+            args,
+            "dblock_target_route_activation_parent_pointer_sha256",
+            "",
+        )
+        or ""
+    )
+    actual_pointer = str(
+        os.environ.get("AGILLM_PARENT_POINTER_SHA256", "") or ""
+    )
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_pointer)
+        or actual_pointer != expected_pointer
+    ):
+        raise ValueError(
+            "legacy XOR-FOLD56 activation parent pointer SHA-256 is missing or "
+            "does not match the explicit one-time binding"
+        )
+    loaded_parent_runtime = str(
+        getattr(args, "_dblock_target_route_loaded_parent_runtime_sha256", "")
+        or ""
+    )
+    if loaded_parent_runtime != _DBLOCK_TARGET_ROUTE_PARENT_RUNTIME_SHA256:
+        raise ValueError(
+            "legacy XOR-FOLD56 activation checkpoint provenance is not bound "
+            "to the reviewed v27.12 parent runtime"
+        )
+    return expected_pointer
+
+
+def _dblock_xor_fold56_coordinates(route_index):
+    """Pure canonical XOR-FOLD56 map for the 56 joint local-gradient targets."""
+    t = _dblock_require_exact_int(route_index, "XOR-FOLD56 route index", minimum=0)
+    k = t % 14
+    q = (t // 14) & 3
+    block = 2 * k if k < 7 else 27 - 2 * k
+    bitreverse2 = 2 * (k & 1) + ((k >> 1) & 1)
+    phase = q ^ bitreverse2
+    layer_offset = phase & 1
+    sublayer = "attn" if (phase >> 1) == 0 else "ffn"
+    return {
+        "canonical_index": int(t % 56),
+        "k": int(k),
+        "q": int(q),
+        "block": int(block),
+        "phase": int(phase),
+        "layer_offset": int(layer_offset),
+        "sublayer": sublayer,
+        "target_id": int(4 * block + phase),
+    }
+
+
+def _dblock_xor_fold56_selftest():
+    if (
+        json.dumps(
+            json.loads(_DBLOCK_TARGET_ROUTE_DESCRIPTOR),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        != _DBLOCK_TARGET_ROUTE_DESCRIPTOR
+        or hashlib.sha256(
+            _DBLOCK_TARGET_ROUTE_DESCRIPTOR.encode("utf-8")
+        ).hexdigest()
+        != _DBLOCK_TARGET_ROUTE_POLICY_SHA256
+    ):
+        raise RuntimeError("XOR-FOLD56 self-test failed: policy digest drifted")
+    rows = [_dblock_xor_fold56_coordinates(t) for t in range(56)]
+    if sorted(row["target_id"] for row in rows) != list(range(56)):
+        raise RuntimeError("XOR-FOLD56 self-test failed: target coverage is not bijective")
+    expected_blocks = [0, 2, 4, 6, 8, 10, 12, 13, 11, 9, 7, 5, 3, 1]
+    if [rows[t]["block"] for t in range(14)] != expected_blocks:
+        raise RuntimeError("XOR-FOLD56 self-test failed: folded block order drifted")
+    for target_id in range(56):
+        clocks = [t for t, row in enumerate(rows) if row["target_id"] == target_id]
+        if len(clocks) != 1:
+            raise RuntimeError("XOR-FOLD56 self-test failed: duplicate target")
+    return True
+
+
+def _dblock_target_route_topology(state):
+    B = _dblock_require_exact_int(state.get("B"), "target-route B", minimum=1)
+    assign = _dblock_json_copy(state.get("assign", []))
+    expected = [[2 * block, 2 * block + 1] for block in range(14)]
+    if B != 14 or assign != expected:
+        raise ValueError(
+            "xor-fold56-v1 requires the checkpoint-compatible 14x2 assignment "
+            "[[0,1],...,[26,27]]"
+        )
+    return {
+        "blocks": 14,
+        "assign": assign,
+        "physical_layers": 28,
+        "principal_sublayers": ["attn", "ffn"],
+        "target_count": 56,
+    }
+
+
+def _dblock_target_route_digest(value):
+    raw = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _dblock_xor_fold56_target(state, route_commit_clock, route_offset):
+    clock = _dblock_require_exact_int(
+        route_commit_clock, "XOR-FOLD56 route commit clock", minimum=0
+    )
+    offset = _dblock_require_exact_int(
+        route_offset, "XOR-FOLD56 route offset", minimum=0, maximum=55
+    )
+    coord = _dblock_xor_fold56_coordinates((clock + offset) % 56)
+    topology = _dblock_target_route_topology(state)
+    physical_layer = int(
+        topology["assign"][coord["block"]][coord["layer_offset"]]
+    )
+    identity = dict(coord)
+    identity.update({
+        "route_commit_clock": int(clock),
+        "route_offset": int(offset),
+        "physical_layer": physical_layer,
+    })
+    identity["target_sha256"] = _dblock_target_route_digest(identity)
+    return identity
+
+
+def _dblock_xor_fold56_bridge_offset(state):
+    """Choose a cyclic rotation from persisted legacy per-block phase residues.
+
+    The continuation snapshot has no authoritative last joint target, and its
+    last_seen values include rejected attempts.  Therefore the bridge deliberately
+    does not invent a previous physical depth from the global clock.
+    """
+    counts = list(state.get("counts", []))
+    if len(counts) != 14 or any(type(value) is not int or value < 0 for value in counts):
+        raise ValueError("XOR-FOLD56 bridge requires 14 exact legacy committed counters")
+    _dblock_require_exact_int(
+        state.get("step"), "XOR-FOLD56 bridge committed step", minimum=0
+    )
+    residues = [value % 4 for value in counts]
+
+    def bridge_key(offset):
+        first = _dblock_xor_fold56_coordinates(offset)
+        phase_mismatch = int(first["phase"] != residues[first["block"]])
+        matches = sum(
+            int(row["phase"] == residues[row["block"]])
+            for row in (
+                _dblock_xor_fold56_coordinates((offset + j) % 56)
+                for j in range(14)
+            )
+        )
+        return (phase_mismatch, -matches, offset)
+
+    return min(range(56), key=bridge_key)
+
+
+def _dblock_target_route_target_map_sha256(state, route_offset):
+    topology_sha = _dblock_target_route_digest(_dblock_target_route_topology(state))
+    cache_key = (topology_sha, int(route_offset))
+    cached = _DBLOCK_TARGET_ROUTE_TARGET_MAP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    rows = []
+    for clock in range(56):
+        target = _dblock_xor_fold56_target(state, clock, route_offset)
+        rows.append({
+            key: target[key]
+            for key in (
+                "canonical_index", "target_id", "block", "phase",
+                "physical_layer", "sublayer",
+            )
+        })
+    digest = _dblock_target_route_digest(rows)
+    _DBLOCK_TARGET_ROUTE_TARGET_MAP_CACHE[cache_key] = digest
+    return digest
+
+
+def _dblock_target_route_validate_runtime_state(state, args):
+    if _dblock_target_route_policy(args) != "xor_fold56_v1":
+        return None
+    route = state.get("target_route")
+    if not isinstance(route, dict):
+        raise ValueError("xor-fold56-v1 runtime route state is missing")
+    expected_keys = {
+        "schema", "policy_id", "policy_version", "policy_sha256",
+        "parent_runtime_sha256", "controller_source_sha256",
+        "activation_parent_pointer_sha256", "topology_sha256", "target_map_sha256",
+        "activation_checkpoint_step", "origin_committed_step", "route_offset",
+        "route_commit_clock", "route_attempt_clock", "pending_target",
+        "last_committed_target",
+    }
+    if set(route) != expected_keys:
+        raise ValueError("xor-fold56-v1 runtime route state keys drifted")
+    if route["schema"] != _DBLOCK_TARGET_ROUTE_SCHEMA:
+        raise ValueError("xor-fold56-v1 route schema mismatch")
+    if route["policy_id"] != _DBLOCK_TARGET_ROUTE_POLICY_ID:
+        raise ValueError("xor-fold56-v1 policy id mismatch")
+    if route["policy_version"] != _DBLOCK_TARGET_ROUTE_POLICY_VERSION:
+        raise ValueError("xor-fold56-v1 policy version mismatch")
+    if route["policy_sha256"] != _DBLOCK_TARGET_ROUTE_POLICY_SHA256:
+        raise ValueError("xor-fold56-v1 formula digest mismatch")
+    if route["parent_runtime_sha256"] != _DBLOCK_TARGET_ROUTE_PARENT_RUNTIME_SHA256:
+        raise ValueError("xor-fold56-v1 parent runtime binding mismatch")
+    if (
+        route["controller_source_sha256"]
+        != _dblock_target_route_controller_source_sha256()
+    ):
+        raise ValueError("xor-fold56-v1 controller source digest mismatch")
+    if not re.fullmatch(
+        r"[0-9a-f]{64}", str(route["activation_parent_pointer_sha256"] or "")
+    ):
+        raise ValueError("xor-fold56-v1 activation pointer digest is invalid")
+    topology = _dblock_target_route_topology(state)
+    topology_sha = _dblock_target_route_digest(topology)
+    if route["topology_sha256"] != topology_sha:
+        raise ValueError("xor-fold56-v1 topology digest mismatch")
+    offset = _dblock_require_exact_int(
+        route["route_offset"], "xor-fold56-v1 route_offset", minimum=0, maximum=55
+    )
+    if route["target_map_sha256"] != _dblock_target_route_target_map_sha256(
+        state, offset
+    ):
+        raise ValueError("xor-fold56-v1 target-map digest mismatch")
+    origin = _dblock_require_exact_int(
+        route["origin_committed_step"], "xor-fold56-v1 origin", minimum=0
+    )
+    clock = _dblock_require_exact_int(
+        route["route_commit_clock"], "xor-fold56-v1 route clock", minimum=0
+    )
+    attempt_clock = _dblock_require_exact_int(
+        route["route_attempt_clock"],
+        "xor-fold56-v1 route attempt clock",
+        minimum=clock,
+    )
+    if int(state.get("step", -1)) != origin + clock:
+        raise ValueError(
+            "xor-fold56-v1 route clock is not bound to committed DBlock clock"
+        )
+    _dblock_require_exact_int(
+        route["activation_checkpoint_step"],
+        "xor-fold56-v1 activation checkpoint",
+        minimum=0,
+    )
+    pending = route["pending_target"]
+    if pending is not None:
+        if not isinstance(pending, dict):
+            raise ValueError("xor-fold56-v1 pending target must be null or a mapping")
+        attempts = _dblock_require_exact_int(
+            pending.get("attempts"), "xor-fold56-v1 pending attempts", minimum=1
+        )
+        first_attempt = _dblock_require_exact_int(
+            pending.get("first_attempt_step"),
+            "xor-fold56-v1 first attempt",
+            minimum=0,
+        )
+        last_attempt = _dblock_require_exact_int(
+            pending.get("last_attempt_step"),
+            "xor-fold56-v1 last attempt",
+            minimum=first_attempt,
+        )
+        expected = _dblock_xor_fold56_target(state, clock, offset)
+        immutable = {
+            key: value for key, value in pending.items()
+            if key not in {"attempts", "first_attempt_step", "last_attempt_step"}
+        }
+        if (
+            immutable != expected
+            or attempts != last_attempt - first_attempt + 1
+            or last_attempt != attempt_clock - 1
+        ):
+            raise ValueError("xor-fold56-v1 pending target identity drifted")
+    last_committed = route["last_committed_target"]
+    if clock == 0:
+        if last_committed is not None:
+            raise ValueError(
+                "xor-fold56-v1 last committed target must be null at clock zero"
+            )
+    else:
+        if not isinstance(last_committed, dict):
+            raise ValueError(
+                "xor-fold56-v1 last committed target is missing after a commit"
+            )
+        expected_last = _dblock_xor_fold56_target(state, clock - 1, offset)
+        bookkeeping = {
+            "attempts", "first_attempt_step", "last_attempt_step",
+            "committed_step_after",
+        }
+        if set(last_committed) != set(expected_last) | bookkeeping:
+            raise ValueError("xor-fold56-v1 last committed target keys drifted")
+        immutable_last = {
+            key: value for key, value in last_committed.items()
+            if key not in bookkeeping
+        }
+        if immutable_last != expected_last:
+            raise ValueError("xor-fold56-v1 last committed target identity drifted")
+        attempts = _dblock_require_exact_int(
+            last_committed["attempts"],
+            "xor-fold56-v1 last committed attempts",
+            minimum=1,
+        )
+        first_attempt = _dblock_require_exact_int(
+            last_committed["first_attempt_step"],
+            "xor-fold56-v1 last committed first attempt",
+            minimum=0,
+        )
+        last_attempt = _dblock_require_exact_int(
+            last_committed["last_attempt_step"],
+            "xor-fold56-v1 last committed last attempt",
+            minimum=first_attempt,
+        )
+        committed_after = _dblock_require_exact_int(
+            last_committed["committed_step_after"],
+            "xor-fold56-v1 last committed step",
+            minimum=1,
+        )
+        if (
+            attempts != last_attempt - first_attempt + 1
+            or last_attempt >= attempt_clock
+            or committed_after != origin + clock
+        ):
+            raise ValueError("xor-fold56-v1 last committed bookkeeping drifted")
+    return route
+
+
+def _dblock_target_route_checkpoint_payload(state, args, checkpoint_step):
+    if _dblock_target_route_policy(args) == "legacy":
+        return None
+    route = _dblock_target_route_validate_runtime_state(state, args)
+    payload = {
+        "schema": _DBLOCK_TARGET_ROUTE_SCHEMA,
+        "checkpoint_step": _dblock_require_exact_int(
+            checkpoint_step, "target-route checkpoint step", minimum=0
+        ),
+        "policy_id": _DBLOCK_TARGET_ROUTE_POLICY_ID,
+        "policy_version": _DBLOCK_TARGET_ROUTE_POLICY_VERSION,
+        "policy_sha256": _DBLOCK_TARGET_ROUTE_POLICY_SHA256,
+        "controller_source_sha256": route["controller_source_sha256"],
+        "activation_parent_pointer_sha256": route[
+            "activation_parent_pointer_sha256"
+        ],
+        "topology_sha256": route["topology_sha256"],
+        "target_map_sha256": route["target_map_sha256"],
+        "state": _dblock_json_copy(route),
+    }
+    payload["sha256"] = _dblock_target_route_digest(payload)
+    return payload
+
+
+def _dblock_target_route_boot(state, args, payload=None, checkpoint_step=0):
+    policy = _dblock_target_route_policy(args)
+    if policy == "legacy":
+        if payload is not None:
+            raise ValueError(
+                "checkpoint has XOR-FOLD56 state but legacy routing was requested"
+            )
+        state["target_route"] = None
+        return None
+    if policy != "xor_fold56_v1":
+        raise ValueError(f"unsupported DBlock target route policy {policy!r}")
+    if bool(getattr(args, "repair_mode", False)):
+        raise ValueError(
+            "xor-fold56-v1 is a continuation policy, not a repair topology migration"
+        )
+    if int(getattr(args, "dblock_train_layers_per_update", 0) or 0) != 1:
+        raise ValueError(
+            "xor-fold56-v1 requires --dblock_train_layers_per_update 1"
+        )
+    if int(getattr(args, "dblock_train_sublayers_per_update", 0) or 0) != 1:
+        raise ValueError(
+            "xor-fold56-v1 requires --dblock_train_sublayers_per_update 1"
+        )
+    if _dblock_sublayer_base_mode(args) not in {"off", "full"}:
+        raise ValueError(
+            "xor-fold56-v1 requires a complete attention+FFN forward path"
+        )
+    if _dblock_router_mode(args) != "shadow":
+        raise ValueError(
+            "xor-fold56-v1 requires the existing learned router to remain shadow-only"
+        )
+    if abs(float(getattr(args, "dblock_router_blend", 0.0) or 0.0)) > 1e-12:
+        raise ValueError("xor-fold56-v1 requires --dblock_router_blend 0.0")
+    if (
+        int(getattr(args, "after_sft_steps", 0) or 0) > 0
+        or str(getattr(args, "after_sft_source", "") or "").strip()
+    ):
+        raise ValueError(
+            "xor-fold56-v1 continuation forbids post-pretraining SFT; the "
+            "metadata-complete pretrain phase final must remain authoritative"
+        )
+    _dblock_xor_fold56_selftest()
+    topology = _dblock_target_route_topology(state)
+    topology_sha = _dblock_target_route_digest(topology)
+    checkpoint_step = _dblock_require_exact_int(
+        checkpoint_step, "target-route loaded checkpoint step", minimum=0
+    )
+    if payload is None:
+        loaded_commit_step = _dblock_require_exact_int(
+            state.get("step"), "xor-fold56-v1 activation committed step", minimum=0
+        )
+        continuing = loaded_commit_step > 0
+        if not continuing:
+            raise ValueError(
+                "xor-fold56-v1 is continuation-only and cannot activate on a "
+                "fresh/zero-step state"
+            )
+        activation_pointer = _dblock_target_route_validate_legacy_activation(
+            args, checkpoint_step
+        )
+        requested_offset = int(
+            getattr(args, "dblock_target_route_offset", -1)
+        )
+        if requested_offset < -1 or requested_offset > 55:
+            raise ValueError(
+                "--dblock_target_route_offset must be -1 (derived) or 0..55"
+            )
+        bridge_offset = _dblock_xor_fold56_bridge_offset(state)
+        if requested_offset >= 0 and requested_offset != bridge_offset:
+            raise ValueError(
+                "explicit XOR-FOLD56 activation offset does not match the "
+                f"checkpoint-derived bridge: {requested_offset} != {bridge_offset}"
+            )
+        route_offset = bridge_offset
+        _dblock_require_exact_int(
+            route_offset, "target-route activation offset", minimum=0, maximum=55
+        )
+        state["target_route"] = {
+            "schema": _DBLOCK_TARGET_ROUTE_SCHEMA,
+            "policy_id": _DBLOCK_TARGET_ROUTE_POLICY_ID,
+            "policy_version": _DBLOCK_TARGET_ROUTE_POLICY_VERSION,
+            "policy_sha256": _DBLOCK_TARGET_ROUTE_POLICY_SHA256,
+            "parent_runtime_sha256": _DBLOCK_TARGET_ROUTE_PARENT_RUNTIME_SHA256,
+            "controller_source_sha256": (
+                _dblock_target_route_controller_source_sha256()
+            ),
+            "activation_parent_pointer_sha256": activation_pointer,
+            "topology_sha256": topology_sha,
+            "target_map_sha256": _dblock_target_route_target_map_sha256(
+                state, route_offset
+            ),
+            "activation_checkpoint_step": int(checkpoint_step),
+            "origin_committed_step": int(loaded_commit_step),
+            "route_offset": int(route_offset),
+            "route_commit_clock": 0,
+            "route_attempt_clock": 0,
+            "pending_target": None,
+            "last_committed_target": None,
+        }
+        print(
+            f"[dblock-target-route] activated {_DBLOCK_TARGET_ROUTE_POLICY_ID} "
+            f"origin={state['target_route']['origin_committed_step']} "
+            f"offset={route_offset} bridge_offset={bridge_offset} "
+            f"policy_sha256={_DBLOCK_TARGET_ROUTE_POLICY_SHA256}",
+            flush=True,
+        )
+        return _dblock_target_route_validate_runtime_state(state, args)
+    if not isinstance(payload, dict):
+        raise ValueError("xor-fold56-v1 checkpoint payload must be a mapping")
+    expected_payload_keys = {
+        "schema", "checkpoint_step", "policy_id", "policy_version",
+        "policy_sha256", "controller_source_sha256",
+        "activation_parent_pointer_sha256", "topology_sha256",
+        "target_map_sha256", "state", "sha256",
+    }
+    if set(payload) != expected_payload_keys:
+        raise ValueError("xor-fold56-v1 checkpoint payload keys drifted")
+    supplied_sha = str(payload.get("sha256") or "")
+    unsigned = {key: value for key, value in payload.items() if key != "sha256"}
+    if supplied_sha != _dblock_target_route_digest(unsigned):
+        raise ValueError("xor-fold56-v1 checkpoint payload digest mismatch")
+    if payload.get("schema") != _DBLOCK_TARGET_ROUTE_SCHEMA:
+        raise ValueError("xor-fold56-v1 checkpoint schema mismatch")
+    if int(payload.get("checkpoint_step", -1)) != checkpoint_step:
+        raise ValueError("xor-fold56-v1 checkpoint clock mismatch")
+    state["target_route"] = _dblock_json_copy(payload.get("state"))
+    route = _dblock_target_route_validate_runtime_state(state, args)
+    requested_offset = int(getattr(args, "dblock_target_route_offset", -1))
+    if requested_offset < -1 or requested_offset > 55:
+        raise ValueError(
+            "--dblock_target_route_offset must be -1 (restored) or 0..55"
+        )
+    if requested_offset >= 0 and requested_offset != int(route["route_offset"]):
+        raise ValueError(
+            "restored XOR-FOLD56 offset does not match the explicit supervisor "
+            f"contract: {route['route_offset']} != {requested_offset}"
+        )
+    for key in (
+        "policy_id", "policy_version", "policy_sha256",
+        "controller_source_sha256", "activation_parent_pointer_sha256",
+        "topology_sha256", "target_map_sha256",
+    ):
+        if payload.get(key) != route.get(key):
+            raise ValueError(
+                f"xor-fold56-v1 checkpoint duplicate binding mismatch: {key}"
+            )
+    print(
+        f"[dblock-target-route] restored {_DBLOCK_TARGET_ROUTE_POLICY_ID} "
+        f"clock={route['route_commit_clock']} offset={route['route_offset']}",
+        flush=True,
+    )
+    return route
+
+
+def _dblock_target_route_begin_attempt(state, args):
+    if _dblock_target_route_policy(args) == "legacy":
+        return None
+    route = _dblock_target_route_validate_runtime_state(state, args)
+    clock = int(route["route_commit_clock"])
+    expected = _dblock_xor_fold56_target(
+        state, clock, int(route["route_offset"])
+    )
+    pending = route.get("pending_target")
+    # This policy-owned clock advances at attempt admission, before any CUDA
+    # work.  Consequently an exception/OOM is still a durable rejected attempt,
+    # while the independent committed route clock remains unchanged.
+    attempt_step = int(route["route_attempt_clock"])
+    if pending is None:
+        pending = dict(expected)
+        pending.update({
+            "attempts": 0,
+            "first_attempt_step": attempt_step,
+            "last_attempt_step": attempt_step,
+        })
+    else:
+        immutable = {
+            key: value for key, value in pending.items()
+            if key not in {"attempts", "first_attempt_step", "last_attempt_step"}
+        }
+        if immutable != expected:
+            raise RuntimeError("xor-fold56-v1 retry target changed before commit")
+    pending["attempts"] = int(pending.get("attempts", 0)) + 1
+    pending["last_attempt_step"] = attempt_step
+    route["route_attempt_clock"] = attempt_step + 1
+    route["pending_target"] = pending
+    _dblock_target_route_validate_runtime_state(state, args)
+    return _dblock_json_copy(pending)
+
+
+def _dblock_target_route_validate_precommit(
+    state, args, block_idx, train_layers, train_sublayers
+):
+    if _dblock_target_route_policy(args) == "legacy":
+        return
+    route = _dblock_target_route_validate_runtime_state(state, args)
+    pending = route.get("pending_target")
+    if not isinstance(pending, dict):
+        raise RuntimeError("xor-fold56-v1 commit attempted without a pending target")
+    expected_sublayers = {
+        int(pending["physical_layer"]): str(pending["sublayer"])
+    }
+    if (
+        int(block_idx) != int(pending["block"])
+        or [int(layer) for layer in train_layers]
+        != [int(pending["physical_layer"])]
+        or {int(key): str(value) for key, value in train_sublayers.items()}
+        != expected_sublayers
+    ):
+        raise RuntimeError(
+            "xor-fold56-v1 selected target drifted before optimizer commit"
+        )
+
+
+def _dblock_target_route_commit(state, args):
+    if _dblock_target_route_policy(args) == "legacy":
+        return
+    route = state.get("target_route")
+    pending = route.get("pending_target") if isinstance(route, dict) else None
+    if not isinstance(pending, dict):
+        raise RuntimeError(
+            "xor-fold56-v1 successful optimizer update has no pending target"
+        )
+    prior_clock = int(route["route_commit_clock"])
+    origin = int(route["origin_committed_step"])
+    if int(state.get("step", -1)) != origin + prior_clock + 1:
+        raise RuntimeError("xor-fold56-v1 commit clock did not advance exactly once")
+    committed = _dblock_json_copy(pending)
+    committed["committed_step_after"] = int(state["step"])
+    route["last_committed_target"] = committed
+    route["route_commit_clock"] = prior_clock + 1
+    route["pending_target"] = None
+    _dblock_target_route_validate_runtime_state(state, args)
 
 
 def _dblock_resume_payload(state, checkpoint_step):
@@ -2640,6 +3316,12 @@ def _dblock_init(core, args):
             int(getattr(args, "_continuation_resume_checkpoint_step", 0) or 0),
             getattr(args, "_continuation_training_profile", ""),
         )
+    _dblock_target_route_boot(
+        state,
+        args,
+        getattr(args, "_continuation_dblock_target_route_state", None),
+        int(getattr(args, "_continuation_resume_checkpoint_step", 0) or 0),
+    )
     return state
 
 
@@ -3982,11 +4664,17 @@ def _dblock_fullstack_ar_anchor(
     every = _dblock_fullstack_anchor_int(args, "dblock_fullstack_ar_every", 0)
     offset = _dblock_fullstack_anchor_signed_int(args, "dblock_fullstack_ar_offset", 0)
     requested_targets = _dblock_fullstack_anchor_int(args, "dblock_fullstack_ar_tokens", 0)
-    max_targets = min(256, requested_targets)
-    if requested_targets > 256 and not bool(state.get("fullstack_anchor_cap_warned", False)):
+    # v27.16: the 256-target repair cap is a hot-configurable ceiling
+    # (dblock_fullstack_anchor_cap) and the crop may span several batch rows
+    # (dblock_fullstack_ar_rows) so the composition anchor can carry a real
+    # end-to-end token budget instead of one 256-token crop.
+    anchor_cap = max(1, _dblock_fullstack_anchor_int(args, "dblock_fullstack_anchor_cap", 256))
+    anchor_rows = max(1, _dblock_fullstack_anchor_int(args, "dblock_fullstack_ar_rows", 1))
+    max_targets = min(anchor_cap, requested_targets)
+    if requested_targets > anchor_cap and not bool(state.get("fullstack_anchor_cap_warned", False)):
         state["fullstack_anchor_cap_warned"] = True
         print(
-            f"[dblock-anchor] requested {requested_targets} targets; repair safety cap is 256",
+            f"[dblock-anchor] requested {requested_targets} targets; anchor cap is {anchor_cap}",
             flush=True,
         )
     weight = _dblock_hot_float(
@@ -4003,7 +4691,12 @@ def _dblock_fullstack_ar_anchor(
     )
     # The owner may tune AR cadence, but cannot indirectly suppress the
     # mandatory v25 SAT anchor by moving AR onto SAT's immutable phase.
+    # v27.16.3: with dblock_fullstack_ar_every == 1 the anchors run back to
+    # back in the same step (SAT keeps its mandatory phase and still runs), so
+    # the precedence skip only applies in round-robin mode; it was silently
+    # dropping the AR composition anchor on every third step.
     if (due and not bool(getattr(args, "repair_mode", False))
+            and every != 1
             and _dblock_fullstack_sat_due(args, state)):
         return {
             "ran": False, "due": True, "finite": True,
@@ -4013,16 +4706,25 @@ def _dblock_fullstack_ar_anchor(
     if not due or ids.size(1) < 2:
         return {"ran": False, "finite": True, "raw": 0.0, "weighted": 0.0, "tokens": 0}
 
-    target_count = min(int(max_targets), int(ids.size(1)) - 1)
-    seq_len = target_count + 1
+    anchor_rows = min(anchor_rows, max(1, int(ids.size(0))))
+    per_row_targets = min(max(1, int(max_targets) // anchor_rows), int(ids.size(1)) - 1)
+    seq_len = per_row_targets + 1
+    target_count = min(int(max_targets), per_row_targets * anchor_rows)
     row = step % max(1, int(ids.size(0)))
     max_start = max(0, int(ids.size(1)) - seq_len)
     # Deterministic but changing crop, so restart receipts are reproducible.
     start = 0 if max_start == 0 else ((step * 104729 + row * 1543) % (max_start + 1))
-    anchor_ids = ids[row:row + 1, start:start + seq_len]
-    anchor_loss_mask = None
-    if loss_mask is not None:
-        anchor_loss_mask = loss_mask[row:row + 1, start + 1:start + seq_len]
+    if anchor_rows == 1:
+        anchor_ids = ids[row:row + 1, start:start + seq_len]
+        anchor_loss_mask = None if loss_mask is None else loss_mask[row:row + 1, start + 1:start + seq_len]
+    else:
+        _rows_sel = [(row + k * 7919) % int(ids.size(0)) for k in range(anchor_rows)]
+        _starts = [0 if max_start == 0 else ((step * 104729 + r * 1543 + k * 65537) % (max_start + 1))
+                   for k, r in enumerate(_rows_sel)]
+        anchor_ids = torch.stack([ids[r, s:s + seq_len] for r, s in zip(_rows_sel, _starts)], dim=0)
+        anchor_loss_mask = None if loss_mask is None else torch.stack(
+            [loss_mask[r, s + 1:s + seq_len] for r, s in zip(_rows_sel, _starts)], dim=0)
+    if anchor_loss_mask is not None:
         if not bool(anchor_loss_mask.any()):
             state["fullstack_anchor_skipped_empty_mask"] = int(
                 state.get("fullstack_anchor_skipped_empty_mask", 0)
@@ -4093,7 +4795,7 @@ def _dblock_fullstack_ar_anchor(
                     proj_w = ar_h.proj.weight.detach()
                     proj_b = None if ar_h.proj.bias is None else ar_h.proj.bias.detach()
                     teacher_logits = F.linear(
-                        h[:, :teacher_logit_positions].detach(),
+                        h[:1, :teacher_logit_positions].detach(),
                         proj_w,
                         proj_b,
                     ).detach()
@@ -4111,12 +4813,12 @@ def _dblock_fullstack_ar_anchor(
                 "teacher_capture_index": int(teacher_capture_index),
                 "popup_layer": int(popup_mapping["layer"]),
                 "popup_sublayer": str(popup_mapping["sublayer"]),
-                "anchor_ids": anchor_ids.detach().clone(),
+                "anchor_ids": anchor_ids[:1].detach().clone(),
                 "anchor_loss_mask": (
                     None if anchor_loss_mask is None
-                    else anchor_loss_mask.detach().clone()),
-                "teacher_hidden": h.detach(),
-                "teacher_hidden_shape": [int(v) for v in h.shape],
+                    else anchor_loss_mask[:1].detach().clone()),
+                "teacher_hidden": h[:1].detach(),
+                "teacher_hidden_shape": [int(v) for v in h[:1].shape],
                 "teacher_logits": teacher_logits,
                 "teacher_logits_shape": (
                     None if teacher_logits is None
@@ -4126,7 +4828,7 @@ def _dblock_fullstack_ar_anchor(
                     None if teacher_logits is None else str(teacher_logits.dtype)),
                 "teacher_logits_pre_parent_commit": True,
                 "teacher_vocab_size": int(ar_h.proj.weight.size(0)),
-                "anchor_ids_sha256": _dblock_tensor_sha256(anchor_ids),
+                "anchor_ids_sha256": _dblock_tensor_sha256(anchor_ids[:1]),
             }
 
         hidden, targets, used, available = _sample_token_loss_inputs(
@@ -4190,7 +4892,7 @@ def _dblock_fullstack_ar_anchor(
         print(
             f"[dblock-anchor] step={step} raw_ce={raw_value:.4f} weight={weight:.4f} "
             f"weighted={weighted_value:.4f} targets={int(used)}/{int(available)} "
-            f"crop=row{row}:{start}+{seq_len} finite={finite} spike={spike} "
+            f"crop=row{row}:{start}+{seq_len} rows={anchor_rows} finite={finite} spike={spike} "
             f"baseline={spike_probe.get('baseline')} softcap={softcap_probe.get('softcapped')} "
             f"cap_ce={softcap_probe.get('cap_ce')} grad_scale={softcap_probe.get('gradient_scale', 1.0):.6f} "
             f"batch_sha256={batch_diagnostics['sha256']} "
@@ -4746,7 +5448,14 @@ def _dblock_fullstack_nat_anchor(core, nat_h, scaler, args, ids, state, loss_mas
     )
     if not due:
         return {"ran": False, "due": False, "finite": True, "raw": 0.0, "weighted": 0.0, "tokens": 0}
-    if _dblock_fullstack_ar_due(args, state) or _dblock_fullstack_sat_due(args, state):
+    # v27.16.2: the overlap guard exists for the AR/SAT/NAT every=3 round-robin.
+    # With dblock_fullstack_ar_every == 1 the AR anchor is due on every step,
+    # so the guard starved this anchor completely (0 NAT anchors since hot rev6);
+    # in that regime the anchors run back to back and the guard is skipped.
+    _ar_every = _dblock_fullstack_anchor_int(args, "dblock_fullstack_ar_every", 0)
+    if _ar_every != 1 and (
+        _dblock_fullstack_ar_due(args, state) or _dblock_fullstack_sat_due(args, state)
+    ):
         state["fullstack_nat_anchor_skipped_overlap"] = int(
             state.get("fullstack_nat_anchor_skipped_overlap", 0)
         ) + 1
@@ -5174,24 +5883,51 @@ def _dblock_ar_protected_aux_grad(
     M = _agillm41_sys.modules[__name__]
     T = int(ids.size(1))
     causal = M.causal_mask(T, structured=M.use_structured_masks(args))
+    _cc_mode = _dblock_clean_context_mode(args)
+    ids_ref, lm_ref = ids, loss_mask
     with M.amp(args.amp):
-        emb = _dblock_local_embedding(core, ids)
-        zt = emb + sig[:, None, None] * torch.randn_like(emb)
-        h = (
-            _dblock_loop_condition(core, ci * zt, bi, args)
-            if bool(getattr(args, "dblock_looped", False))
-            else ci * zt
-        )
-        h = _dblock_local_span_forward(
-            core, bi, layers, train_layers, h, causal,
-            use_layer_checkpoint, args, state,
-            train_sublayers=train_sublayers,
-        )
-        denoised = _dblock_local_final_norm(core, cs * zt + co * h)
+        if _cc_mode in ("deep", "e2e"):
+            # v27.16.3: the AR reference direction must be the objective the AR
+            # steps actually train (deep clean context below the block, frozen
+            # checkpointed stack above it in e2e mode) on the same local rows;
+            # the legacy whole-batch noised-embedding reference was the
+            # non-composing objective and the memory peak of every SAT/NAT step.
+            _rows = _dblock_local_rows(args, ids)
+            ids_ref = ids[:_rows]
+            lm_ref = loss_mask[:_rows] if loss_mask is not None else None
+            emb = _dblock_deep_context_input(core, ids_ref, min(int(x) for x in layers), causal, args)
+            zt = _dblock_clean_context_noise(args, sig[:_rows], emb)
+            h = (
+                _dblock_loop_condition(core, zt, bi, args)
+                if bool(getattr(args, "dblock_looped", False))
+                else zt
+            )
+            h = _dblock_local_span_forward(
+                core, bi, layers, train_layers, h, causal,
+                use_layer_checkpoint, args, state,
+                train_sublayers=train_sublayers,
+            )
+            if _cc_mode == "e2e":
+                h = _dblock_frozen_suffix_forward(core, max(int(x) for x in layers), h, causal, args)
+            denoised = _dblock_local_final_norm(core, h)
+        else:
+            emb = _dblock_local_embedding(core, ids)
+            zt = emb + sig[:, None, None] * torch.randn_like(emb)
+            h = (
+                _dblock_loop_condition(core, ci * zt, bi, args)
+                if bool(getattr(args, "dblock_looped", False))
+                else ci * zt
+            )
+            h = _dblock_local_span_forward(
+                core, bi, layers, train_layers, h, causal,
+                use_layer_checkpoint, args, state,
+                train_sublayers=train_sublayers,
+            )
+            denoised = _dblock_local_final_norm(core, cs * zt + co * h)
 
-    ar_loss_mask = loss_mask[:, 1:] if loss_mask is not None else None
+    ar_loss_mask = lm_ref[:, 1:] if lm_ref is not None else None
     ar_hidden, ar_targets, ar_used, ar_total = _sample_token_loss_inputs(
-        denoised[:, :-1], ids[:, 1:], _dblock_loss_token_cap(args, "ar"),
+        denoised[:, :-1], ids_ref[:, 1:], _dblock_loss_token_cap(args, "ar"),
         ar_loss_mask,
     )
     ar_raw = fused_ce(
@@ -6452,6 +7188,255 @@ def _weight_accel_checkpoint_metadata(args):
     return runtime.summary()
 # ===== END AGILLM43 WEIGHT-TRAJECTORY ACCELERATOR V1 =====
 
+def _dblock_target_route_anchor_audit(family, info=None, *, completed=True):
+    """Normalize full-stack anchor activity for per-attempt route receipts."""
+    family = str(family)
+    if not completed:
+        return {
+            "family": family,
+            "call_started": True,
+            "call_completed": False,
+            "ran": False,
+            "accepted": False,
+            "finite": None,
+            "spike": None,
+            "reason": "call_aborted_before_receipt",
+            "sequence_tokens": 0,
+            "target_tokens": 0,
+        }
+    info = dict(info or {})
+    ran = bool(info.get("ran", False))
+    finite = bool(info.get("finite", False)) if ran else None
+    spike = bool(info.get("spike", False)) if ran else False
+    target_tokens = int(info.get("tokens", 0) or 0)
+    sequence_tokens = (
+        target_tokens + (1 if ran else 0)
+        if family == "ar" else int(info.get("seq_len", 0) or 0)
+    )
+    return {
+        "family": family,
+        "call_started": True,
+        "call_completed": True,
+        "ran": ran,
+        "accepted": bool(ran and finite and not spike),
+        "finite": finite,
+        "spike": spike,
+        "reason": str(info.get("reason") or ""),
+        "sequence_tokens": int(sequence_tokens),
+        "target_tokens": int(target_tokens),
+    }
+
+
+def _dblock_emit_target_route_receipt(state, args):
+    """Emit exactly one audit record at every normal DBlock attempt return."""
+    if _dblock_target_route_policy(args) == "legacy":
+        return None
+    route = _dblock_target_route_validate_runtime_state(state, args)
+    receipt = state.get("training_science_last_receipt")
+    if not isinstance(receipt, dict) or not receipt.get("route_policy_id"):
+        raise RuntimeError("xor-fold56-v1 attempt has no route receipt")
+    if bool(receipt.get("_target_route_audit_emitted", False)):
+        existing = receipt.get("target_route")
+        if not isinstance(existing, dict):
+            raise RuntimeError("xor-fold56-v1 receipt emission marker is corrupt")
+        return _dblock_json_copy(existing)
+    committed = bool(receipt.get("committed", False))
+    event = {
+        "schema": "agillm43.dblock.target-route.receipt.v1",
+        "policy_id": _DBLOCK_TARGET_ROUTE_POLICY_ID,
+        "policy_sha256": _DBLOCK_TARGET_ROUTE_POLICY_SHA256,
+        "route_policy_id": _DBLOCK_TARGET_ROUTE_POLICY_ID,
+        "route_policy_sha256": _DBLOCK_TARGET_ROUTE_POLICY_SHA256,
+        "controller_source_sha256": str(route["controller_source_sha256"]),
+        "attempt_step": int(receipt.get("attempt_step", 0)),
+        "route_attempt_clock_after": int(route["route_attempt_clock"]),
+        "dblock_attempt_step_after": int(state.get("attempt_step", 0) or 0),
+        "route_clock_before": int(receipt.get("route_clock_before", 0)),
+        "route_clock_after": int(route["route_commit_clock"]),
+        "route_offset": int(route["route_offset"]),
+        "target_id": int(receipt.get("target_id", -1)),
+        "target_sha256": str(receipt.get("target_sha256") or ""),
+        "block": int(receipt.get("block", -1)),
+        "forward_layers": list(receipt.get("forward_layers", []) or []),
+        "train_layers": list(receipt.get("train_layers", []) or []),
+        "train_sublayers": list(receipt.get("train_sublayers", []) or []),
+        "anchors": _dblock_json_copy(receipt.get("anchors", {}) or {}),
+        "committed": committed,
+        "outcome": str(
+            receipt.get("route_outcome")
+            or ("optimizer_committed" if committed else "rejected")
+        ),
+        "committed_step_before": int(receipt.get("committed_step_before", 0)),
+        "committed_step_after": int(
+            receipt.get("committed_step_after", state.get("step", 0))
+        ),
+        "pending_target_after": _dblock_json_copy(route["pending_target"]),
+        "committed_target": (
+            _dblock_json_copy(route["last_committed_target"])
+            if committed else None
+        ),
+    }
+    receipt["route_clock_after"] = int(event["route_clock_after"])
+    receipt["route_pending_after"] = _dblock_json_copy(
+        event["pending_target_after"]
+    )
+    receipt["target_route"] = _dblock_json_copy(event)
+    receipt["_target_route_audit_emitted"] = True
+    print(
+        "[dblock-target-route-receipt] "
+        + json.dumps(
+            event, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ),
+        flush=True,
+    )
+    return event
+
+
+
+# ───────────── AGILLM43 v27.16: deep-context DBlock local objective (20260906) ─────────────
+_DBLOCK_CLEAN_CONTEXT_MODES = ("off", "deep", "e2e")
+
+
+def _dblock_clean_context_mode(args):
+    raw = str(getattr(args, "dblock_clean_context", "off") or "off").strip().lower()
+    if raw in {"", "0", "off", "false", "none", "no"}:
+        return "off"
+    if raw in {"deep", "stack"}:
+        return "deep"
+    if raw in {"e2e", "masked_e2e", "fullstack", "1", "on", "true"}:
+        return "e2e"
+    raise ValueError(f"unknown --dblock_clean_context {raw!r}; expected off|deep|e2e")
+
+
+def _dblock_clean_context_noise(args, sig, like):
+    """Band noise for the deep/e2e input: sigma scaled by --dblock_clean_context_noise_scale
+    (1.0 = legacy band sigma; 0.0 = clean input)."""
+    scale = float(getattr(args, "dblock_clean_context_noise_scale", 1.0) or 0.0)
+    if scale <= 0.0:
+        return like
+    return like + (scale * sig)[:, None, None].to(like.dtype) * torch.randn_like(like)
+
+
+def _dblock_frozen_suffix_forward(core, last_layer, h, mask, args):
+    """e2e mode: run every layer above the selected DBlock with its parameters
+    frozen (no parameter gradient) and per-layer activation checkpointing, so the
+    exact top-of-stack loss can be backpropagated into the selected sublayer at
+    O(1 layer) live activation memory.  Returns the final-norm input hidden."""
+    last_layer = int(last_layer)
+    upper = list(range(last_layer + 1, len(core.blocks)))
+    if not upper:
+        return h
+    if getattr(core, "hc", None) is not None:
+        raise RuntimeError("e2e DBlock suffix is not defined for Hyper-Connections")
+    snapshots = []
+    for li in upper:
+        for param in core.blocks[li].parameters():
+            snapshots.append((param, bool(param.requires_grad)))
+            param.requires_grad_(False)
+    def _frozen_recompute(y, block):
+        # Non-reentrant checkpoint recomputes this block during backward, after
+        # the outer scope has restored requires_grad.  Re-freeze inside every
+        # invocation so the recomputed graph saves exactly what the original
+        # forward saved (and never resurrects parameter grads for this block).
+        inner = [(param, bool(param.requires_grad)) for param in block.parameters()]
+        for param, _ in inner:
+            param.requires_grad_(False)
+        try:
+            return _run_block_forward(block, y, mask, "off")
+        finally:
+            for param, original in inner:
+                param.requires_grad_(original)
+    try:
+        for li in upper:
+            block = core.blocks[li]
+            h = _ck.checkpoint(lambda y, block=block: _frozen_recompute(y, block), h, use_reentrant=False)
+            if getattr(core, "anchor", None) is not None and li == int(getattr(core, "anchor_position", -1)):
+                h = core.anchor(h)[0]
+    finally:
+        # Frozen upper routers must not add MoE auxiliary terms to the local loss.
+        _dblock_clear_moe_stash_for_layers(core, upper)
+        for param, original in snapshots:
+            param.requires_grad_(original)
+    return h
+
+
+def _dblock_local_rows(args, ids):
+    rows = int(_dblock_fullstack_anchor_int(args, "dblock_local_rows", 0) or 0)
+    if rows <= 0 or rows >= int(ids.size(0)):
+        return int(ids.size(0))
+    return rows
+
+
+def _dblock_deep_context_input(core, ids, first_layer, mask, args):
+    """Residual-stream input of DBlock ``first_layer``: the frozen plain stack
+    below it, run on the token embeddings with the objective's own attention
+    mask.  No gradient ever flows into or out of it (shared vocab state stays
+    detached exactly like _dblock_local_embedding)."""
+    first_layer = int(first_layer)
+    with torch.no_grad():
+        h = core.emb(ids)
+        if first_layer > 0:
+            if getattr(core, "hc", None) is not None:
+                raise RuntimeError("deep DBlock context is not defined for Hyper-Connections")
+            for li in range(first_layer):
+                h = _run_block(core.blocks[li], h, mask, False, args, "off")
+                if getattr(core, "anchor", None) is not None and li == int(getattr(core, "anchor_position", -1)):
+                    h = core.anchor(h)[0]
+            _dblock_clear_moe_stash_for_layers(core, list(range(first_layer)))
+    return h.detach()
+
+
+def _dblock_depth_anchor(core, ar_h, args, ids, state, loss_mask=None):
+    """No-grad composition receipt: plain-stack next-token CE after each DBlock
+    on the same deterministic crop the full-stack AR anchor uses."""
+    every = int(getattr(args, "dblock_depth_anchor_every", 0) or 0)
+    step = int(state.get("step", 0))
+    if every <= 0 or step % every != 0 or ids.size(1) < 2:
+        return None
+    tokens = max(8, min(256, int(getattr(args, "dblock_depth_anchor_tokens", 256) or 256)))
+    target_count = min(tokens, int(ids.size(1)) - 1)
+    seq_len = target_count + 1
+    row = step % max(1, int(ids.size(0)))
+    max_start = max(0, int(ids.size(1)) - seq_len)
+    start = 0 if max_start == 0 else ((step * 104729 + row * 1543) % (max_start + 1))
+    crop = ids[row:row + 1, start:start + seq_len]
+    keep = None
+    if loss_mask is not None:
+        keep = loss_mask[row:row + 1, start + 1:start + seq_len].reshape(-1).to(torch.bool)
+        if not bool(keep.any()):
+            return None
+    M = _agillm41_sys.modules[__name__]
+    groups = _dblock_block_layers(core, int(getattr(args, "dblock_blocks", 14) or 14))
+    ends = {int(g[-1]): gi for gi, g in enumerate(groups)}
+    out = {}
+    with torch.no_grad(), _dblock_deterministic_anchor_context(core, crop):
+        causal = M.causal_mask(seq_len, structured=M.use_structured_masks(args))
+        W = _dblock_local_head_weight(ar_h)
+        with M.amp(args.amp):
+            h = core.emb(crop)
+            for li, block in enumerate(core.blocks):
+                h = _run_block(block, h, causal, False, args, "off")
+                if getattr(core, "anchor", None) is not None and li == int(getattr(core, "anchor_position", -1)):
+                    h = core.anchor(h)[0]
+                if li in ends:
+                    hid = core.ln(h)[:, :-1].reshape(-1, h.size(-1))
+                    tgt = crop[:, 1:].reshape(-1)
+                    if keep is not None:
+                        hid, tgt = hid[keep], tgt[keep]
+                    ce = fused_ce(hid, W, tgt)
+                    out[f"d{ends[li] + 1}"] = round(float(ce.detach().float().item()), 4)
+        _dblock_clear_moe_aux_stash(core)
+    print(
+        "[dblock-depth-anchor] " + json.dumps({
+            "step": step, "crop": f"row{row}:{start}+{seq_len}", "targets": int(target_count),
+            "ce_after_block": out,
+        }, sort_keys=True),
+        flush=True,
+    )
+    state["dblock_depth_anchor_last"] = {"step": step, "ce_after_block": out}
+    return out
+
+
 def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_mask=None):
     M = _agillm41_sys.modules[__name__]
     # Teacher activations are single-attempt transients.  A rejected/aborted
@@ -6459,9 +7444,10 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
     state.pop("_det50_teacher_packet", None)
     state["last_update_trained"] = False
     state["training_science_last_receipt"] = {
-        "schema": "agillm43.dblock.science.receipt.v1",
+        "schema": "agillm43.dblock.science.receipt.v2",
         "committed": False,
         "attempt_step": int(state.get("attempt_step", 0) or 0),
+        "dblock_attempt_step_before": int(state.get("attempt_step", 0) or 0),
         "committed_step_before": int(state.get("step", 0) or 0),
         "block": None,
         "layers": [],
@@ -6495,24 +7481,72 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
             _rc_ctx = _rc_ctx / torch.sqrt(_rc_ctx.square().mean() + 1e-6)
             state["router_ctx"] = _rc_ctx.to("cpu")
             del _rc_ctx, _rc_emb
-    bi = _choose_block(state, args)
-    bi = _dblock_router_shadow_observe(state, args, bi)
+    route_target = _dblock_target_route_begin_attempt(state, args)
+    if route_target is None:
+        bi = _choose_block(state, args)
+        bi = _dblock_router_shadow_observe(state, args, bi)
+    else:
+        bi = int(route_target["block"])
+        # The existing learned router has a 14-block output head. It may observe
+        # the deterministic teacher block, but it cannot control a 56-way joint
+        # target and its return value is intentionally ignored here.
+        _dblock_router_shadow_observe(state, args, bi)
     lo, hi = sorted([bs[bi], bs[bi + 1]])
     layers = [int(layer) for layer in asg[bi]]
     if state.get("looped", False):
         layers = [int(layer) for layer in (state.get("loop_group") or layers)]
-    train_layers = _dblock_select_train_layers(state, args, bi, layers)
-    train_sublayers = _dblock_select_train_sublayers(state, args, bi, layers, train_layers)
+    if route_target is None:
+        train_layers = _dblock_select_train_layers(state, args, bi, layers)
+        train_sublayers = _dblock_select_train_sublayers(
+            state, args, bi, layers, train_layers
+        )
+    else:
+        train_layers = [int(route_target["physical_layer"])]
+        if train_layers[0] not in layers:
+            raise RuntimeError(
+                "xor-fold56-v1 physical layer is outside selected forward DBlock"
+            )
+        train_sublayers = {
+            train_layers[0]: str(route_target["sublayer"])
+        }
     train_sublayer_rows, train_sublayer_param_count = _dblock_train_sublayer_receipt(
         core, train_layers, train_sublayers
     )
     state["training_science_last_receipt"].update({
+        "attempt_step": (
+            int(state.get("attempt_step", 0) or 0)
+            if route_target is None
+            else int(route_target["last_attempt_step"])
+        ),
         "block": int(bi),
         "layers": [int(layer) for layer in train_layers],
         "forward_layers": [int(layer) for layer in layers],
         "train_layers": [int(layer) for layer in train_layers],
         "train_sublayers": train_sublayer_rows,
         "selected_train_param_count": int(train_sublayer_param_count),
+        "route_policy_id": (
+            None if route_target is None else _DBLOCK_TARGET_ROUTE_POLICY_ID
+        ),
+        "route_policy_sha256": (
+            None if route_target is None else _DBLOCK_TARGET_ROUTE_POLICY_SHA256
+        ),
+        "route_clock_before": (
+            None if route_target is None
+            else int(route_target["route_commit_clock"])
+        ),
+        "route_clock_after": (
+            None if route_target is None
+            else int(route_target["route_commit_clock"])
+        ),
+        "route_offset": (
+            None if route_target is None else int(route_target["route_offset"])
+        ),
+        "target_id": (
+            None if route_target is None else int(route_target["target_id"])
+        ),
+        "target_sha256": (
+            None if route_target is None else str(route_target["target_sha256"])
+        ),
     })
     sig = _sample_sigma(ids, lo, hi, args, state)
     cs, co, ci = _edm_pre(sig)
@@ -6561,11 +7595,64 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         "train_layers": [int(layer) for layer in train_layers],
         "train_sublayers": train_sublayer_rows,
         "selected_train_param_count": int(train_sublayer_param_count),
+        "target_route": (
+            None if route_target is None else _dblock_json_copy(route_target)
+        ),
         "batch": _dblock_token_boundary_diagnostics(ids, loss_mask),
         "objectives": {},
     }
 
-    if run_ar:
+    _cc_mode = _dblock_clean_context_mode(args)
+    if run_ar and _cc_mode in ("deep", "e2e"):
+        # v27.16 deep-context local AR: block input = frozen plain stack below the
+        # block (+ optional band noise); plain block; e2e additionally runs the
+        # frozen stack above it so the loss is the exact serving next-token CE.
+        _rows = _dblock_local_rows(args, ids)
+        ids_l = ids[:_rows]
+        lm_l = loss_mask[:_rows] if loss_mask is not None else None
+        sig_l = sig[:_rows]
+        causal = M.causal_mask(T, structured=M.use_structured_masks(args))
+        _t = _profile_tic(prof)
+        with M.amp(args.amp):
+            emb = _dblock_deep_context_input(core, ids_l, min(int(x) for x in layers), causal, args)
+            zt = _dblock_clean_context_noise(args, sig_l, emb)
+            h = _dblock_loop_condition(core, zt, bi, args) if state.get("looped", False) else zt
+            h = _dblock_local_span_forward(
+                core, bi, layers, train_layers, h, causal,
+                bool(use_layer_checkpoint), args, state,
+                train_sublayers=train_sublayers,
+            )
+            if _cc_mode == "e2e":
+                h = _dblock_frozen_suffix_forward(core, max(int(x) for x in layers), h, causal, args)
+            Dn = _dblock_local_final_norm(core, h)
+        _profile_toc(state, "ar_forward", _t)
+        _t = _profile_tic(prof)
+        ar_loss_mask = lm_l[:, 1:] if lm_l is not None else None
+        ar_hidden, ar_targets, ar_used, ar_total = _sample_token_loss_inputs(
+            Dn[:, :-1], ids_l[:, 1:], _dblock_loss_token_cap(args, "ar"), ar_loss_mask
+        )
+        ar_raw = fused_ce(ar_hidden, _dblock_local_head_weight(ar_h), ar_targets)
+        local_diagnostics["objectives"]["ar"] = {
+            "input": {
+                "sha256": local_diagnostics["batch"]["sha256"],
+                "source": "%s_rows%d_below_layer%d" % (_cc_mode, int(_rows), min(int(x) for x in layers)),
+            },
+            "selected_targets": _dblock_token_boundary_diagnostics(ar_targets),
+            "selected_target_count": int(ar_used),
+            "available_target_count": int(ar_total),
+        }
+        ar = ar_weight * w * ar_raw
+        ar_raw_val, ar_val = _dblock_scalar_values(ar_raw, ar)
+        _profile_toc(state, "ar_ce", _t)
+        _t = _profile_tic(prof)
+        _aux = _collect_moe_aux(core, getattr(args,'moe_aux_coef',0.0), getattr(args,'moe_z_coef',0.0))
+        if torch.is_tensor(_aux):
+            ar = ar + _aux.to(ar.dtype)
+        scaler.scale(ar).backward()
+        pending_supervised["ar"] = int(ar_used)
+        _profile_toc(state, "ar_backward", _t)
+        del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar_raw, ar, ar_used, ar_total, ids_l, lm_l, sig_l
+    elif run_ar:
         causal = M.causal_mask(T, structured=M.use_structured_masks(args))
         _t = _profile_tic(prof)
         with M.amp(args.amp):
@@ -6609,28 +7696,47 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
     if run_sat:
         smask = M.sat_mask(T, structured=M.use_structured_masks(args))
         _t = _profile_tic(prof)
-        with M.amp(args.amp):
-            emb2 = _dblock_local_embedding(core, ids)
-            zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
-            h2 = _dblock_loop_condition(core, ci * zt2, bi, args) if state.get("looped", False) else ci * zt2
-            h2 = _dblock_local_span_forward(
-                core, bi, layers, train_layers, h2, smask,
-                bool(use_layer_checkpoint), args, state,
-                train_sublayers=train_sublayers,
-            )
-            Ds = _dblock_local_final_norm(core, cs * zt2 + co * h2)
+        if _cc_mode in ("deep", "e2e"):
+            _rows_s = _dblock_local_rows(args, ids)
+            ids_s = ids[:_rows_s]
+            lm_s = loss_mask[:_rows_s] if loss_mask is not None else None
+            with M.amp(args.amp):
+                emb2 = _dblock_deep_context_input(core, ids_s, min(int(x) for x in layers), smask, args)
+                zt2 = _dblock_clean_context_noise(args, sig[:_rows_s], emb2)
+                h2 = _dblock_loop_condition(core, zt2, bi, args) if state.get("looped", False) else zt2
+                h2 = _dblock_local_span_forward(
+                    core, bi, layers, train_layers, h2, smask,
+                    bool(use_layer_checkpoint), args, state,
+                    train_sublayers=train_sublayers,
+                )
+                if _cc_mode == "e2e":
+                    h2 = _dblock_frozen_suffix_forward(core, max(int(x) for x in layers), h2, smask, args)
+                Ds = _dblock_local_final_norm(core, h2)
+        else:
+            ids_s = ids
+            lm_s = loss_mask
+            with M.amp(args.amp):
+                emb2 = _dblock_local_embedding(core, ids)
+                zt2 = emb2 + sig[:, None, None] * torch.randn_like(emb2)
+                h2 = _dblock_loop_condition(core, ci * zt2, bi, args) if state.get("looped", False) else ci * zt2
+                h2 = _dblock_local_span_forward(
+                    core, bi, layers, train_layers, h2, smask,
+                    bool(use_layer_checkpoint), args, state,
+                    train_sublayers=train_sublayers,
+                )
+                Ds = _dblock_local_final_norm(core, cs * zt2 + co * h2)
         _profile_toc(state, "sat_forward", _t)
         _t = _profile_tic(prof)
         # SAT decode uses the latest SAT_BLOCK hidden states to emit the next
         # SAT_BLOCK tokens. Train that contract densely across the context.
         sat_ctx = Ds[:, :-SATB]
-        sat_tgt = ids[:, SATB:]
+        sat_tgt = ids_s[:, SATB:]
         if sat_ctx.size(1) == 0 or sat_ctx.size(1) != sat_tgt.size(1):
             sat_ctx = Ds[:, :-1]
-            sat_tgt = ids[:, 1:]
+            sat_tgt = ids_s[:, 1:]
         sat_loss_mask = None
-        if loss_mask is not None:
-            sat_loss_mask = loss_mask[:, SATB:] if sat_ctx.size(1) == loss_mask[:, SATB:].size(1) else loss_mask[:, 1:]
+        if lm_s is not None:
+            sat_loss_mask = lm_s[:, SATB:] if sat_ctx.size(1) == lm_s[:, SATB:].size(1) else lm_s[:, 1:]
         sat_hidden, sat_targets, sat_used, sat_total = _sample_sat_pair_loss_inputs(
             sat_ctx, sat_tgt, _dblock_loss_token_cap(args, "sat"),
             sat_loss_mask, block=SATB,
@@ -6666,18 +7772,22 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         scaler.scale(sat).backward()
         pending_supervised["sat"] = int(sat_used)
         _profile_toc(state, "sat_backward", _t)
-        del smask, emb2, zt2, h2, Ds, sat_hidden, sat_targets, satf, satv, sat_raw, sat, sat_used, sat_total
+        del smask, emb2, zt2, h2, Ds, sat_hidden, sat_targets, satf, satv, sat_raw, sat, sat_used, sat_total, ids_s, lm_s
 
     if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
         nat_mode = str(getattr(args, "dblock_nat_embed_noise_mode", "off") or "off").strip().lower()
         nat_noise_scale = max(0.0, float(getattr(args, "dblock_nat_embed_noise_scale", 1.0) or 1.0))
         nat_ids = M._nat_ids_for_training(ids, int(getattr(args, "nat_max_tokens", 0)))
+        if _cc_mode in ("deep", "e2e"):
+            # v27.16.1: deep/e2e NAT runs the frozen stack on the local row
+            # subset only (the full batch through the checkpointed suffix OOMs).
+            nat_ids = nat_ids[:_dblock_local_rows(args, ids)]
         _t = _profile_tic(prof)
         with M.amp(args.amp):
             nat_in = nat_ids.clone()
             lm_nat = (
-                loss_mask[:, -nat_ids.size(1):] if loss_mask is not None else None
+                loss_mask[:nat_ids.size(0), -nat_ids.size(1):] if loss_mask is not None else None
             )
             try:
                 m = M._nat_corruption_mask(
@@ -6759,6 +7869,10 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
             else:
                 nat_in[m] = M.NAT_MASK_ID
                 hn = _dblock_local_embedding(core, nat_in)
+            if _cc_mode in ("deep", "e2e") and nat_mode not in {"visible", "mask_plus_noise"}:
+                # v27.16: the corrupted sequence enters the block through the
+                # frozen plain stack below it (bidirectional, as NAT serves).
+                hn = _dblock_deep_context_input(core, nat_in, min(int(x) for x in layers), None, args)
             if state.get("looped", False):
                 hn = _dblock_loop_condition(core, hn, bi, args)
             hn = _dblock_local_span_forward(
@@ -6766,6 +7880,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
                 bool(use_layer_checkpoint), args, state,
                 train_sublayers=train_sublayers,
             )
+            if _cc_mode == "e2e" and nat_mode not in {"visible", "mask_plus_noise"}:
+                hn = _dblock_frozen_suffix_forward(core, max(int(x) for x in layers), hn, None, args)
             Dnat = _dblock_local_final_norm(core, hn)
         _profile_toc(state, "nat_forward", _t)
         _t = _profile_tic(prof)
@@ -6799,6 +7915,11 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         _profile_toc(state, "nat_backward", _t)
         del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat_raw, nat, nat_used, nat_total
 
+    if _cc_mode in ("deep", "e2e"):
+        try:
+            _dblock_depth_anchor(core, ar_h, args, ids, state, loss_mask=loss_mask)
+        except Exception as _depth_exc:  # receipt only; never fails a step
+            print(f"[dblock-depth-anchor] skipped: {_depth_exc!r}", flush=True)
     total_val = ar_val + sat_val + nat_val
     raw_total_val = ar_raw_val + sat_raw_val + nat_raw_val
     raw_count = int(bool(run_ar)) + int(bool(run_sat)) + int(bool(run_nat))
@@ -6856,6 +7977,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         _profile_toc(state, "step_total", _step_t)
         _profile_step_done(state, args)
         _update_stats(state, bi, raw_avg_val, args, objective=objective, trained=False)
+        state["training_science_last_receipt"]["route_outcome"] = "local_nonfinite"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
     local_spike_probe = _dblock_local_spike_probe(
@@ -6917,6 +8040,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
                 "repair fail-fast: local DBlock loss spike exhausted "
                 f"{rejection['consecutive']}/{rejection['limit']} retries"
             )
+        state["training_science_last_receipt"]["route_outcome"] = "local_loss_spike"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
     aux_guard_info = {"ran": False, "reason": "local_ar_objective"}
@@ -6938,9 +8063,15 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
     if matryoshka_info.get("ran"):
         local_diagnostics["matryoshka"] = _dblock_json_copy(matryoshka_info)
 
+    state["training_science_last_receipt"]["anchors"]["ar"] = (
+        _dblock_target_route_anchor_audit("ar", completed=False)
+    )
     anchor_info = _dblock_fullstack_ar_anchor(
         core, ar_h, scaler, args, ids, state, loss_mask=loss_mask,
         batch_diagnostics=local_diagnostics["batch"],
+    )
+    state["training_science_last_receipt"]["anchors"]["ar"] = (
+        _dblock_target_route_anchor_audit("ar", anchor_info)
     )
     if anchor_info.get("ran") and not anchor_info.get("finite", False):
         opt.zero_grad(set_to_none=True)
@@ -6955,6 +8086,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         _profile_toc(state, "step_total", _step_t)
         _profile_step_done(state, args)
         _update_stats(state, bi, raw_avg_val, args, objective=objective, trained=False)
+        state["training_science_last_receipt"]["route_outcome"] = "ar_anchor_nonfinite"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
 
@@ -6989,11 +8122,19 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
             f"({rejection['consecutive']}/{rejection['limit']})",
             flush=True,
         )
+        state["training_science_last_receipt"]["route_outcome"] = "ar_anchor_spike"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
+    state["training_science_last_receipt"]["anchors"]["sat"] = (
+        _dblock_target_route_anchor_audit("sat", completed=False)
+    )
     sat_anchor_info = _dblock_fullstack_sat_anchor(
         core, sat_h, scaler, args, ids, state, loss_mask=loss_mask,
         batch_diagnostics=local_diagnostics["batch"],
+    )
+    state["training_science_last_receipt"]["anchors"]["sat"] = (
+        _dblock_target_route_anchor_audit("sat", sat_anchor_info)
     )
     if sat_anchor_info.get("ran") and not sat_anchor_info.get("finite", False):
         opt.zero_grad(set_to_none=True)
@@ -7007,6 +8148,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         _profile_toc(state, "step_total", _step_t)
         _profile_step_done(state, args)
         _update_stats(state, bi, raw_avg_val, args, objective=objective, trained=False)
+        state["training_science_last_receipt"]["route_outcome"] = "sat_anchor_nonfinite"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
 
@@ -7041,10 +8184,18 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
             f"({rejection['consecutive']}/{rejection['limit']})",
             flush=True,
         )
+        state["training_science_last_receipt"]["route_outcome"] = "sat_anchor_spike"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
+    state["training_science_last_receipt"]["anchors"]["nat"] = (
+        _dblock_target_route_anchor_audit("nat", completed=False)
+    )
     nat_anchor_info = _dblock_fullstack_nat_anchor(
         core, nat_h, scaler, args, ids, state, loss_mask=loss_mask
+    )
+    state["training_science_last_receipt"]["anchors"]["nat"] = (
+        _dblock_target_route_anchor_audit("nat", nat_anchor_info)
     )
     if nat_anchor_info.get("reason") == "no_valid_doc_crop_telemetry":
         consecutive = int(
@@ -7069,6 +8220,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         _profile_toc(state, "step_total", _step_t)
         _profile_step_done(state, args)
         _update_stats(state, bi, raw_avg_val, args, objective=objective, trained=False)
+        state["training_science_last_receipt"]["route_outcome"] = "nat_anchor_nonfinite"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
 
@@ -7103,6 +8256,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
             f"({rejection['consecutive']}/{rejection['limit']})",
             flush=True,
         )
+        state["training_science_last_receipt"]["route_outcome"] = "nat_anchor_spike"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
 
     _t = _profile_tic(prof)
@@ -7142,6 +8297,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         _profile_toc(state, "step_total", _step_t)
         _profile_step_done(state, args)
         _update_stats(state, bi, raw_avg_val, args, objective=objective, trained=False)
+        state["training_science_last_receipt"]["route_outcome"] = "gradient_nonfinite"
+        _dblock_emit_target_route_receipt(state, args)
         return raw_avg_val
     state["sat_variable_gate_grad_last"] = {
         "main_preclip_norm": float(torch.as_tensor(_main_grad_norm).detach().cpu()),
@@ -7162,6 +8319,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
             ),
             flush=True,
         )
+    _dblock_target_route_validate_precommit(
+        state, args, bi, train_layers, train_sublayers
+    )
     scaler.step(opt)
     scaler.update()
     _scale_after = float(scaler.get_scale()) if hasattr(scaler, "get_scale") else None
@@ -7207,6 +8367,8 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
     _update_stats(
         state, bi, raw_avg_val, args, objective=objective, trained=_optimizer_committed
     )
+    if _optimizer_committed:
+        _dblock_target_route_commit(state, args)
     _weight_accel_after_update(
         core, opt, args, state, bi, train_layers, objective, raw_avg_val,
         _optimizer_committed,
@@ -7218,26 +8380,22 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
     state["training_science_last_receipt"].update({
         "committed": bool(_optimizer_committed),
         "committed_step_after": int(state.get("step", 0) or 0),
+        "route_clock_after": (
+            None if route_target is None
+            else int(state["target_route"]["route_commit_clock"])
+        ),
+        "route_pending_after": (
+            None if route_target is None
+            else _dblock_json_copy(state["target_route"]["pending_target"])
+        ),
         "local_objectives": local_objectives,
         "local_passes": int(len(local_objectives)),
-        "anchors": {
-            "ar": {
-                "ran": bool(anchor_info.get("ran") and anchor_info.get("finite", False) and not anchor_info.get("spike", False)),
-                "sequence_tokens": int(anchor_info.get("tokens", 0) or 0) + (1 if anchor_info.get("ran") else 0),
-                "target_tokens": int(anchor_info.get("tokens", 0) or 0),
-            },
-            "sat": {
-                "ran": bool(sat_anchor_info.get("ran") and sat_anchor_info.get("finite", False) and not sat_anchor_info.get("spike", False)),
-                "sequence_tokens": int(sat_anchor_info.get("seq_len", 0) or 0),
-                "target_tokens": int(sat_anchor_info.get("tokens", 0) or 0),
-            },
-            "nat": {
-                "ran": bool(nat_anchor_info.get("ran") and nat_anchor_info.get("finite", False) and not nat_anchor_info.get("spike", False)),
-                "sequence_tokens": int(nat_anchor_info.get("seq_len", 0) or 0),
-                "target_tokens": int(nat_anchor_info.get("tokens", 0) or 0),
-            },
-        },
+        "anchors": _dblock_json_copy(
+            state["training_science_last_receipt"].get("anchors", {})
+        ),
     })
+    if not _optimizer_committed:
+        state["training_science_last_receipt"]["route_outcome"] = "amp_overflow"
     _maybe_log(
         state,
         args,
@@ -7254,6 +8412,7 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state, loss_m
         raw_total=raw_total_val,
         edm_weight=w,
     )
+    _dblock_emit_target_route_receipt(state, args)
     return raw_avg_val
 
 # ===== END dblocks_train.py =====
@@ -16907,9 +18066,45 @@ def _training_science_step(
     block_param_counts = list(topology.get("trainable_block_params_by_layer", []) or [])
     total_block_params = max(0, int(topology.get("trainable_block_params", 0) or 0))
     receipt = {}
+    target_route_receipt = None
     if isinstance(dblock_state, dict):
         receipt = dict(dblock_state.get("training_science_last_receipt", {}) or {})
         committed = bool(receipt.get("committed", committed))
+        route_runtime = dblock_state.get("target_route")
+        if isinstance(receipt.get("target_route"), dict):
+            target_route_receipt = _dblock_json_copy(receipt["target_route"])
+        elif receipt.get("route_policy_id") and isinstance(route_runtime, dict):
+            target_route_receipt = {
+                "schema": "agillm43.dblock.target-route.receipt.v1",
+                "policy_id": str(receipt.get("route_policy_id") or ""),
+                "policy_sha256": str(receipt.get("route_policy_sha256") or ""),
+                "controller_source_sha256": str(
+                    route_runtime.get("controller_source_sha256") or ""
+                ),
+                "route_clock_before": int(receipt.get("route_clock_before", 0)),
+                "route_clock_after": int(route_runtime.get("route_commit_clock", 0)),
+                "route_offset": int(receipt.get("route_offset", 0)),
+                "target_id": int(receipt.get("target_id", -1)),
+                "target_sha256": str(receipt.get("target_sha256") or ""),
+                "block": int(receipt.get("block", -1)),
+                "forward_layers": list(receipt.get("forward_layers", []) or []),
+                "train_layers": list(receipt.get("train_layers", []) or []),
+                "train_sublayers": list(receipt.get("train_sublayers", []) or []),
+                "committed": bool(committed),
+                "committed_step_before": int(
+                    receipt.get("committed_step_before", 0)
+                ),
+                "committed_step_after": int(
+                    receipt.get("committed_step_after", dblock_state.get("step", 0))
+                ),
+                "pending_target_after": _dblock_json_copy(
+                    route_runtime.get("pending_target")
+                ),
+                "committed_target": (
+                    _dblock_json_copy(route_runtime.get("last_committed_target"))
+                    if committed else None
+                ),
+            }
     layers = [int(value) for value in receipt.get("layers", []) if isinstance(value, (int, float))]
     if not isinstance(dblock_state, dict):
         layers = list(range(total_layers))
@@ -16987,6 +18182,7 @@ def _training_science_step(
             "layer_token_updates": float(layer_update_delta),
             "full_stack_equiv_tokens": float(full_stack_equiv_delta),
             "param_equiv_tokens": float(param_equiv_delta),
+            "target_route": _dblock_json_copy(target_route_receipt),
         },
     })
     if isinstance(dblock_state, dict):
@@ -16996,12 +18192,15 @@ def _training_science_step(
         state["committed_objective_steps"] = copy.deepcopy(
             dblock_state.get("committed_objective_steps", {}) or {}
         )
+    training_event = {
+        "step": int(step), "seen_tok": int(seen_tok),
+        "committed": bool(committed), "loss": state.get("latest_loss"),
+    }
+    if target_route_receipt is not None:
+        training_event["target_route"] = _dblock_json_copy(target_route_receipt)
     _training_science_log(
         args, "training_window",
-        extra={
-            "step": int(step), "seen_tok": int(seen_tok),
-            "committed": bool(committed), "loss": state.get("latest_loss"),
-        },
+        extra=training_event,
     )
 
     snapshot = _training_science_snapshot(args)
@@ -21777,6 +22976,47 @@ def _agillm43_continuation_package_receipt(path, meta, checkpoint_tokenizer_payl
                 continuation_state.get("committed_step", 0) or 0
             ),
         })
+    target_route = meta.get("continuation_dblock_target_route_state")
+    if isinstance(target_route, dict):
+        unsigned_route = {
+            key: value for key, value in target_route.items() if key != "sha256"
+        }
+        if str(target_route.get("sha256") or "") != _dblock_target_route_digest(
+            unsigned_route
+        ):
+            raise RuntimeError("training pointer target-route payload digest mismatch")
+        route_state = target_route.get("state")
+        if not isinstance(route_state, dict):
+            raise RuntimeError("training pointer target-route state is missing")
+        receipt.update({
+            "dblock_target_route_schema": target_route.get("schema"),
+            "dblock_target_route_payload_sha256": target_route.get("sha256"),
+            "dblock_target_route_policy_id": target_route.get("policy_id"),
+            "dblock_target_route_policy_sha256": target_route.get(
+                "policy_sha256"
+            ),
+            "dblock_target_route_controller_source_sha256": target_route.get(
+                "controller_source_sha256"
+            ),
+            "dblock_target_route_topology_sha256": target_route.get(
+                "topology_sha256"
+            ),
+            "dblock_target_route_target_map_sha256": target_route.get(
+                "target_map_sha256"
+            ),
+            "dblock_target_route_clock": int(
+                route_state.get("route_commit_clock", 0) or 0
+            ),
+            "dblock_target_route_offset": int(
+                route_state.get("route_offset", 0) or 0
+            ),
+            "dblock_target_route_pending_target": _dblock_json_copy(
+                route_state.get("pending_target")
+            ),
+            "dblock_target_route_last_committed_target": _dblock_json_copy(
+                route_state.get("last_committed_target")
+            ),
+        })
     validation_state = meta.get("quality_validation_state")
     if isinstance(validation_state, dict):
         receipt["quality_validation_checks"] = int(
@@ -22272,6 +23512,12 @@ def load_ckpt(path, core, ar_h, sat_h, opt, scaler, nat_h=None,
             ),
             "continuation_dblock_router_state": copy.deepcopy(
                 ck.get("continuation_dblock_router_state")
+            ),
+            "continuation_dblock_direct56_state": copy.deepcopy(
+                ck.get("continuation_dblock_direct56_state")
+            ),
+            "continuation_dblock_target_route_state": copy.deepcopy(
+                ck.get("continuation_dblock_target_route_state")
             ),
             "agillm43_training_profile": ck.get("agillm43_training_profile", ""),
             "agillm43_sat_variable_gate_feature_schema": ck.get(
@@ -24093,6 +25339,14 @@ def _train_phase(
                 _dblock_router_checkpoint_payload(_DBS, args, int(save_step))
                 if _DBS is not None else None
             )
+            payload["continuation_dblock_direct56_state"] = (
+                _dblock_direct56_checkpoint_payload(_DBS, args, int(save_step))
+                if _DBS is not None else None
+            )
+            payload["continuation_dblock_target_route_state"] = (
+                _dblock_target_route_checkpoint_payload(_DBS, args, int(save_step))
+                if _DBS is not None else None
+            )
         _matryoshka_meta = _matryoshka_checkpoint_payload(
             args, cfg, save_seen_tok, _DBS)
         if _matryoshka_meta is not None:
@@ -24463,6 +25717,26 @@ def _train_phase(
         except RuntimeError as e:
             msg = str(e).lower()
             if "out of memory" in msg or "cuda error" in msg:
+                _dblock_route_oom = False
+                if getattr(args, "dblock", False) and isinstance(_DBS, dict):
+                    route_runtime = _DBS.get("target_route")
+                    route_receipt = _DBS.get("training_science_last_receipt")
+                    if (
+                        isinstance(route_runtime, dict)
+                        and isinstance(route_runtime.get("pending_target"), dict)
+                        and not bool(
+                            (route_receipt or {}).get(
+                                "_target_route_audit_emitted", False
+                            )
+                        )
+                    ):
+                        if not isinstance(route_receipt, dict):
+                            raise RuntimeError(
+                                "xor-fold56-v1 OOM lost its attempt receipt"
+                            ) from e
+                        _dblock_route_oom = True
+                        route_receipt["route_outcome"] = "cuda_oom_or_error"
+                        _dblock_emit_target_route_receipt(_DBS, args)
                 batch_accum = []
                 try:
                     del ids, tgt_ar, loss_mask
@@ -24492,35 +25766,55 @@ def _train_phase(
                 if oom_retries <= MAX_OOM_RETRIES:
                     print(f"\n[{phase_name} OOM] Retry {oom_retries}/{MAX_OOM_RETRIES} at Batch={BATCH}, clearing VRAM...")
                     time.sleep(2)
-                    continue
-                oom_retries = 0
-                if BATCH > 1:
-                    entry = _oom_backoff_entry(oom_state, oom_key, oom_signature) if _oom_backoff_enabled(args) else {}
-                    if _oom_backoff_enabled(args):
-                        _nb = _oom_backoff_next_batch(args, entry, BATCH)
-                    else:
-                        _known_safe = max(0, int(getattr(args, "oom_known_safe_batch", 0) or 0))
-                        _nb = _known_safe if 0 < _known_safe < BATCH else max(1, int(BATCH * 0.85))
-                    if _nb >= BATCH:
-                        _nb = BATCH - 1
-                    print(f"\n[{phase_name} OOM] Reducing Batch: {BATCH} -> {_nb} (persistent learned backoff, state={oom_state_path})")
-                    BATCH = _nb
-                    oom_good_steps = 0
-                    time.sleep(2)
                 else:
-                    new_block = max(128, int(BLOCK * 0.8))
-                    new_block = max(128, (new_block // 128) * 128)
-                    if new_block >= BLOCK:
-                        new_block = max(128, BLOCK - 128)
-                    print(f"\n[{phase_name} OOM] Reducing Block: {BLOCK} -> {new_block}")
-                    BLOCK = new_block
-                    oom_good_steps = 0
-                    if _oom_backoff_enabled(args):
-                        BATCH, oom_state, oom_state_path, oom_key, oom_signature = _oom_backoff_start(args, phase_name, BLOCK, BATCH)
-                    time.sleep(2)
+                    oom_retries = 0
+                    if BATCH > 1:
+                        entry = _oom_backoff_entry(oom_state, oom_key, oom_signature) if _oom_backoff_enabled(args) else {}
+                        if _oom_backoff_enabled(args):
+                            _nb = _oom_backoff_next_batch(args, entry, BATCH)
+                        else:
+                            _known_safe = max(0, int(getattr(args, "oom_known_safe_batch", 0) or 0))
+                            _nb = _known_safe if 0 < _known_safe < BATCH else max(1, int(BATCH * 0.85))
+                        if _nb >= BATCH:
+                            _nb = BATCH - 1
+                        print(f"\n[{phase_name} OOM] Reducing Batch: {BATCH} -> {_nb} (persistent learned backoff, state={oom_state_path})")
+                        BATCH = _nb
+                        oom_good_steps = 0
+                        time.sleep(2)
+                    else:
+                        new_block = max(128, int(BLOCK * 0.8))
+                        new_block = max(128, (new_block // 128) * 128)
+                        if new_block >= BLOCK:
+                            new_block = max(128, BLOCK - 128)
+                        print(f"\n[{phase_name} OOM] Reducing Block: {BLOCK} -> {new_block}")
+                        BLOCK = new_block
+                        oom_good_steps = 0
+                        if _oom_backoff_enabled(args):
+                            BATCH, oom_state, oom_state_path, oom_key, oom_signature = _oom_backoff_start(args, phase_name, BLOCK, BATCH)
+                        time.sleep(2)
                 steps_since_last_grow = 0
-                continue
-            raise
+                if not _dblock_route_oom:
+                    continue
+                # The policy-owned attempt clock was advanced before CUDA work.
+                # Fall through to the common rejected-attempt heartbeat/flush
+                # path so a persistent OOM cannot starve a requested checkpoint.
+                _prior_loss = _prov_loss
+                if (
+                    (isinstance(_prior_loss, bool) or not isinstance(
+                        _prior_loss, (int, float)
+                    ) or not math.isfinite(float(_prior_loss)))
+                    and isinstance(provenance_cache, dict)
+                ):
+                    _prior_loss = provenance_cache.get("loss")
+                loss_value = (
+                    float(_prior_loss)
+                    if not isinstance(_prior_loss, bool)
+                    and isinstance(_prior_loss, (int, float))
+                    and math.isfinite(float(_prior_loss))
+                    else float("nan")
+                )
+            else:
+                raise
         _dblock_attempt_rejected = bool(
             getattr(args, "dblock", False)
             and not bool(_DBS.get("last_update_trained", False))
@@ -25941,6 +27235,11 @@ def train(args):
             detachable_50m_runtime=detachable_50m_runtime,
         )
         print(f"Resumed from step {start_step}")
+    loaded_route_parent_provenance = _resume_meta.get("agillm43_provenance")
+    args._dblock_target_route_loaded_parent_runtime_sha256 = str(
+        loaded_route_parent_provenance.get("train_script_sha256") or ""
+        if isinstance(loaded_route_parent_provenance, dict) else ""
+    ).lower()
     if bool(getattr(args, "require_exact_resume_state", False)):
         if not args.resume or args.fresh:
             raise ValueError(
@@ -25965,6 +27264,17 @@ def train(args):
             required_resume_coverage["dblock_router"] = isinstance(
                 _resume_meta.get("continuation_dblock_router_state"), dict
             )
+        if (
+            _dblock_target_route_policy(args) == "xor_fold56_v1"
+        ):
+            target_route_payload = _resume_meta.get(
+                "continuation_dblock_target_route_state"
+            )
+            if isinstance(target_route_payload, dict):
+                required_resume_coverage["dblock_target_route"] = True
+            else:
+                _dblock_target_route_validate_legacy_activation(args, start_step)
+                required_resume_coverage["dblock_target_route_legacy_activation"] = True
         if isinstance(_resume_meta.get(_DET50_MANIFEST_KEY), dict):
             required_resume_coverage["detachable_50m_model_optimizer_scaler_rng"] = bool(
                 _resume_meta.get("detachable_50m_state_loaded")
@@ -26173,6 +27483,12 @@ def train(args):
         )
         args._continuation_dblock_router_state = _resume_meta.get(
             "continuation_dblock_router_state"
+        )
+        args._continuation_dblock_direct56_state = _resume_meta.get(
+            "continuation_dblock_direct56_state"
+        )
+        args._continuation_dblock_target_route_state = _resume_meta.get(
+            "continuation_dblock_target_route_state"
         )
         args._continuation_training_profile = str(
             _resume_meta.get("agillm43_training_profile") or ""
@@ -26388,6 +27704,16 @@ def train(args):
         print(
             "[repair] stateful step-named phase final is authoritative; "
             "skipping duplicate final.pt",
+            flush=True,
+        )
+        return
+    if (
+        bool(getattr(args, "dblock", False))
+        and _dblock_target_route_policy(args) == "xor_fold56_v1"
+    ):
+        print(
+            "[dblock-target-route] pretrain_final.pt with exact continuation "
+            "state is authoritative; skipping metadata-incomplete final.pt",
             flush=True,
         )
         return
@@ -28749,6 +30075,61 @@ def supervise_agillm43(args):
     template = set_arg(template, "--dblock_log_every", 25)
     template = set_arg(template, "--cuda_max_reserved_mib", 0)
     template = set_arg(template, "--cuda_min_free_mib", 0)
+    # Versioned v27.13 route contract.  Activation remains a numeric value
+    # argument because persistent supervisor overrides always append a value.
+    # The exact legacy pointer/step bindings make a retained activation=1 safe:
+    # after the first candidate checkpoint, route state is mandatory instead.
+    template = set_arg(
+        template,
+        "--dblock_target_route_policy",
+        os.environ.get(
+            "AGILLM43_DBLOCK_TARGET_ROUTE_POLICY", "xor_fold56_v1"
+        ),
+    )
+    template = set_arg(
+        template,
+        "--dblock_target_route_activate_from_checkpoint",
+        os.environ.get(
+            "AGILLM43_DBLOCK_TARGET_ROUTE_ACTIVATE_FROM_CHECKPOINT", "1"
+        ),
+    )
+    template = set_arg(
+        template,
+        "--dblock_target_route_activation_checkpoint_step",
+        os.environ.get(
+            "AGILLM43_DBLOCK_TARGET_ROUTE_ACTIVATION_CHECKPOINT_STEP", "-1"
+        ),
+    )
+    template = set_arg(
+        template,
+        "--dblock_target_route_activation_parent_pointer_sha256",
+        os.environ.get(
+            "AGILLM43_DBLOCK_TARGET_ROUTE_ACTIVATION_PARENT_POINTER_SHA256", ""
+        ),
+    )
+    template = set_arg(
+        template,
+        "--dblock_target_route_offset",
+        os.environ.get("AGILLM43_DBLOCK_TARGET_ROUTE_OFFSET", "-1"),
+    )
+    template = set_arg(template, "--dblock_direct56_enabled", "1")
+    template = set_arg(template, "--dblock_router", "shadow")
+    template = set_arg(template, "--dblock_router_blend", "0.0")
+    template = set_arg(template, "--dblock_train_layers_per_update", "1")
+    template = set_arg(template, "--dblock_train_sublayers_per_update", "1")
+    template = set_arg(
+        template,
+        "--granularity_label",
+        "one-sublayer-local-grad-direct56-teacher-v27.16",
+    )
+    # v27.16 deep-context local objective; env-driven so the durable child argv
+    # stays owned by the supervisor spec.  Defaults reproduce v27.15 exactly.
+    template = set_arg(template, "--dblock_clean_context", os.environ.get("AGILLM43_DBLOCK_CLEAN_CONTEXT", "off"))
+    template = set_arg(template, "--dblock_local_rows", os.environ.get("AGILLM43_DBLOCK_LOCAL_ROWS", "0"))
+    template = set_arg(template, "--dblock_clean_context_noise_scale", os.environ.get("AGILLM43_DBLOCK_CC_NOISE_SCALE", "1.0"))
+    template = set_arg(template, "--dblock_depth_anchor_every", os.environ.get("AGILLM43_DBLOCK_DEPTH_ANCHOR_EVERY", "0"))
+    template = set_arg(template, "--dblock_fullstack_anchor_cap", os.environ.get("AGILLM43_DBLOCK_FULLSTACK_ANCHOR_CAP", "256"))
+    template = set_arg(template, "--dblock_fullstack_ar_rows", os.environ.get("AGILLM43_DBLOCK_FULLSTACK_AR_ROWS", "1"))
 
     # The supervisor owns the durable child argv.  Popup launch state is therefore
     # explicitly environment-driven and defaults off; no manual edit of a current
@@ -32230,6 +33611,16 @@ def main():
                     help="SAFE gradient granularity below a physical layer. 0 trains both principal sublayers; 1 rotates one LN1+attention or LN2+FFN/MoE target while retaining the complete forward. Current safe primitive requires --dblock_train_layers_per_update 1.")
     tr.add_argument("--dblock_train_sublayer_policy", choices=["cyclic"], default="cyclic",
                     help="Deterministic one-sublayer schedule: layer0-attn, layer1-attn, layer0-ffn, layer1-ffn for each two-layer DBlock, driven by checkpointed per-block commit counts.")
+    tr.add_argument("--dblock_target_route_policy", choices=["legacy", "xor_fold56_v1"], default="legacy",
+                    help="Authoritative joint (block, physical layer, principal sublayer) selector. xor_fold56_v1 uses successful commits only and persists an exact pending retry target.")
+    tr.add_argument("--dblock_target_route_activate_from_checkpoint", type=int, choices=[0, 1], default=0,
+                    help="Set to 1 for the one-time bridge from a legacy full continuation checkpoint into hash-bound XOR-FOLD56 state.")
+    tr.add_argument("--dblock_target_route_activation_checkpoint_step", type=int, default=-1,
+                    help="Exact committed step of the single legacy checkpoint authorized to activate XOR-FOLD56; required with activation=1.")
+    tr.add_argument("--dblock_target_route_activation_parent_pointer_sha256", default="",
+                    help="Exact immutable training-pointer record SHA-256 for the single authorized legacy activation; compared with AGILLM_PARENT_POINTER_SHA256.")
+    tr.add_argument("--dblock_target_route_offset", type=int, default=-1,
+                    help="Canonical XOR-FOLD56 cyclic rotation 0..55. -1 deterministically bridges legacy per-block phase residues at first activation.")
     tr.add_argument("--dblock_schedule", choices=["random", "roundrobin", "balanced", "loss_balanced"], default="balanced",
                     help="How --dblock chooses the next layer block. balanced equalises attempted updates across sigma bands while tracking commits separately; loss_balanced uses per-band relative regression, never incomparable raw CE.")
     tr.add_argument("--dblock_router", choices=["heuristic", "shadow", "transformer"], default="heuristic",
@@ -32246,6 +33637,8 @@ def main():
                     help="Deterministic tiny-router internal layer schedule. cyclic is the terminating primitive and does not invoke another learned router.")
     tr.add_argument("--dblock_router_full_anchor_every", type=int, default=0,
                     help="Train every tiny-router encoder layer every N successful shadow updates; 0 disables full-router anchors.")
+    tr.add_argument("--dblock_direct56_enabled", type=int, choices=[0, 1], default=0,
+                    help="Enable checkpointed direct56 teacher training and validated automatic handover.")
     tr.add_argument("--dblock_router_lr", type=float, default=0.002,
                     help="Online learning rate for the context/history sequence-Transformer DBlock router.")
     tr.add_argument("--dblock_router_blend", type=float, default=0.35,
@@ -32362,6 +33755,20 @@ def main():
                     help="Use EOS-delimited NAT documents, reject clean mask-ID2, and use loss_mask only to select supervised targets.")
     tr.add_argument("--dblock_fullstack_nat_no_valid_crop_limit", type=int, default=8,
                     help="Fail a repair after this many consecutive due NAT anchors cannot find a 128-token single-document crop; strict repair pins 8.")
+    tr.add_argument("--dblock_clean_context", default="off",
+                    help="v27.16: off=legacy noised-embedding local objective; deep=block input is the frozen plain stack below the block (+band noise), plain block, frozen norm/head CE; e2e=deep plus the frozen checkpointed stack above the block so the local sublayer receives the exact serving next-token gradient (masked end-to-end).")
+    tr.add_argument("--dblock_clean_context_noise_scale", type=float, default=1.0,
+                    help="v27.16: multiplier on the band sigma noise added to the deep/e2e block input (0 = clean input).")
+    tr.add_argument("--dblock_local_rows", type=int, default=0,
+                    help="v27.16: if >0, run the local DBlock objective on the first N batch rows only (token CE caps still apply).")
+    tr.add_argument("--dblock_depth_anchor_every", type=int, default=0,
+                    help="v27.16: if >0, emit a no-grad [dblock-depth-anchor] receipt every N steps (plain-stack next-token CE after each DBlock on the AR-anchor crop).")
+    tr.add_argument("--dblock_depth_anchor_tokens", type=int, default=256,
+                    help="v27.16: crop targets for the depth anchor receipt (<=256).")
+    tr.add_argument("--dblock_fullstack_anchor_cap", type=int, default=256,
+                    help="v27.16: ceiling on full-stack AR anchor targets per step (was a fixed 256). Hot-configurable.")
+    tr.add_argument("--dblock_fullstack_ar_rows", type=int, default=1,
+                    help="v27.16: number of batch rows the full-stack AR anchor crops per step (targets are split across rows). Hot-configurable.")
     tr.add_argument("--dblock_ar_loss_tokens", type=int, default=0,
                     help="If >0, uniformly sample this many AR target positions per DBlock step for stochastic token-level CE. Hot-configurable via dblock_ar_loss_tokens or dblock.loss_tokens.")
     tr.add_argument("--dblock_sat_loss_tokens", type=int, default=0,
@@ -32643,17 +34050,76 @@ def main():
     else: raise SystemExit(f"unknown command: {args.cmd}")
 
 
-# Isolated v26 multimode overlay followed by the v27.6 post-hoc
-# Matryoshka teacher-output objective.  The live source imports neither module.
-from det50_multimode_v26_overlay import install as _install_det50_multimode_v26
-_install_det50_multimode_v26(globals())
-from det50_posthoc_matryoshka_v27_6_overlay import (install as
-    _install_det50_posthoc_matryoshka_v27_6)
-_install_det50_posthoc_matryoshka_v27_6(globals())
-from det50_sat_gate_v27_13_overlay import install as _install_det50_sat_gate_v27_13
-_install_det50_sat_gate_v27_13(globals())
-from det50_teacher_packet_all_fullstack_overlay import install as _install_det50_teacher_packet_all_fullstack
-_install_det50_teacher_packet_all_fullstack(globals())
+# ===== Self-contained live det50 support (2026-09-05) =====
+import types as _agillm_sf_types
+import sys as _agillm_sf_sys
+import linecache as _agillm_sf_linecache
+import base64 as _agillm_sf_base64
+import hashlib as _agillm_sf_hashlib
+import io as _agillm_sf_io
+_AGILLM_SF_SEED_BYTES = _agillm_sf_base64.b64decode('UEsDBBQAAAAIAAAAIQAId4sIRAQAAIAEAAAKABQAd2VpZ2h0Lm5weQEAEACABAAAAAAAAEQEAAAAAAAAncj7P9V3HMBxjiGdlutQcinqOG7lsraOOt/P+1g6WW6JTjMZxbK5jVBJiKyEcNBR69FlCNloxI7V+XzeXw0Z6lGPLLqtmnVh2R55aCW19i/s9dvrqQwI9Q/apK2VrpUp2hqTuiVFJLETrYz1ErnYiWKTUranRCVGJqVsjfnPfaPiU2Peeuq2qOSYt+/o8f5yF7GLXZbd/252tOIkmcmdYJuafdHAups8X+kuO/3NBbRwPs5qvGox6UkkmGVX0tyxZeSabyUYuRexy/4Iv9/NY32TD4hn+yy0uaeC+87T7MKgJbje4GRGk2Fs1LyXi3vqRmZ6jvGz1yXx2yaN+FOl65ltoSe+WF/BRMt0QF46RBS9PTDyZFrj2ZdGBgp1OYmjBRaTYub1UsrKS9+VSf5GJHkmslu3dmHf3DUwezKPNK3xkVWHW5EbjWeInHjSRlUdedbvBrqvVvJ/niiHJw22KFjBUCc6mBSO7qfa7zxnsk4LtDxdBWdRzL+nyGP1VJ8UXasDQfxHIH9p31Wv3gflitVMR7uECVoGWfSHbfTj4vkgGW/ReHzeTdclhZJdvmuphbAN5Kv9iDOTE/qlGFKKA8lgnLb0ovcKfmD5d1y4ZTMQ0RIMF8+hNZsPEbXBr6DXqYTH50146/ReLuu37lWXdDthXnYzbAzZCRONcyFHoMKpNCHuntwPlumu5EjIQ25joxw9nlZhfqMZvq5YwGeeM0dpvRLCajzBYeY2Sw09QJXfS0iAQwA8GDHFRo9Z6ORWwqRVdzhVaQf2r80AsUkF0BJjVJdVgsCASPVqjyIxzKR3DRU8ug1AutkdomrQI62DDjJlSPCqm64FaJTxgqWJZ8jXYxv43huR3HnZAnbVcoL7IcKdZUkXwpnRfvpTwlI+wTsM4y+3srRnEeBXdRTKNn+FHSHl5GxPNWtRe4GTvIMZk4Ps2r09bLuxAPpWj5MdDvP4wlYPXsd7CWe0/RHtirRl6ss+xL2tBGvtC2iRuZVMY84TYWIymV8SApf+MIMYsCZ+qnBZu+axxlR8EV9PCOCvKwVwZ4onpldysKe+gRkf9sc5TVV4XCuQc4sPZLGxddgb+oZmkwF0CtcCrUNDqF0ZDYmr5HBTcQ4dFwvZwzPF3NJ9njKT0zr4ZrgFFjkWoEJxhJwImNAEJV+FuwcXw/2Lr6B5hx0VVkxrohUDtH7qs64fixOYg2sZeNt9wVtLx9jYmJr4dl0iEYF1F4o6JGAeqI+yneMwHBfJCSV7ccfLk8Q/aAW8aD0L3QUqXtXwFGw0Rcj9Y0WtTJcAi9D3Ceg15ts7mkCxYRFt35IMufpabEC9hywsC8YF9vbU9no+KPf+DNXXv6UHatajqzIVPokZgvojwfjpsSJq+MFhUpttAPlXH5GuzpHzUdcr2W3DYAzMO0XiMsqZS/9G2jM2QV2yhrmOHAPIFdrwPb/sJvaDyP4FUEsDBBQAAAAIAAAAIQBiwvLySAAAAIQAAAAIABQAYmlhcy5ucHkBABAAhAAAAAAAAABIAAAAAAAAAJvsF+obEMnIUMZQrZ6SWpxcpG6loG6TZqKuo6Cell9UUpSYF59flJIKEndLzClOBYoXZyQWpAL5GoY6mjoKtQoUAK5FPqzOAFBLAwQUAAAACAAAACEAHIBb2UgAAACEAAAADQAUAHRocmVzaG9sZC5ucHkBABAAhAAAAAAAAABIAAAAAAAAAJvsF+obEMnIUMZQrZ6SWpxcpG6loG6TZqKuo6Cell9UUpSYF59flJIKEndLzClOBYoXZyQWpAL5GoY6mjoKtQoUAK7yffX2AFBLAQIUAxQAAAAIAAAAIQAId4sIRAQAAIAEAAAKAAAAAAAAAAAAAACAAQAAAAB3ZWlnaHQubnB5UEsBAhQDFAAAAAgAAAAhAGLC8vJIAAAAhAAAAAgAAAAAAAAAAAAAAIABgAQAAGJpYXMubnB5UEsBAhQDFAAAAAgAAAAhAByAW9lIAAAAhAAAAA0AAAAAAAAAAAAAAIABAgUAAHRocmVzaG9sZC5ucHlQSwUGAAAAAAMAAwCpAAAAiQUAAAAA')
+if _agillm_sf_hashlib.sha256(_AGILLM_SF_SEED_BYTES).hexdigest() != '9262ea3fc5cc7e4d3dc5d14aac125bd5459ce314cac05c3c11de45224e14dd94':
+    raise RuntimeError('embedded SAT seed digest mismatch')
+
+# Folded module: det50_multimode_v26_overlay
+_AGILLM_SF_SOURCE = '"""Isolated v27 training overlay for the detachable 50M AGILLM popup.\n\nThis is the frozen v26 overlay plus a copy-on-write NAT refinement repair and a\nfresh, cryptographically auditable post-fix qualification window. ``install``\npatches only a staged candidate namespace after all v25 definitions load; the\nproduction source and running process are never imported or modified.\n"""\n\nfrom __future__ import annotations\n\nimport base64\nimport os\n\n\nMANIFEST_SCHEMA = "agillm5.detachable-50m.v2"\nMULTIMODE_SCHEMA = "agillm5.detachable-50m.multimode.v1"\nPREVIOUS_COUNTERS_SCHEMA = "agillm5.detachable-50m.counters.v2"\nCOUNTERS_SCHEMA = "agillm5.detachable-50m.counters.v3"\nPOST_FIX_QUALIFICATION_KEY = "agillm5_detachable_50m_post_fix_qualification"\nPOST_FIX_QUALIFICATION_SCHEMA = (\n    "agillm5.detachable-50m.post-fix-qualification.v1"\n)\nQUALIFICATION_WINDOW_SCHEMA = (\n    "agillm5.detachable-50m.qualification-window.v1"\n)\nNAT_AUTOGRAD_FIX_ID = "v27-nat-refinement-input-copy-on-write-20260831"\nPOST_FIX_START_SHA_ENV = (\n    "AGILLM43_DETACHABLE50M_POST_FIX_START_CHECKPOINT_SHA256"\n)\nPOST_FIX_REQUIRED_COMMITS = {\n    "ar": 128,\n    "sat_fixed": 128,\n    "sat_variable": 128,\n    "nat": 128,\n}\nCHECKPOINT_KEY = "agillm5_detachable_50m_multimode"\nCAPABILITIES_KEY = "agillm5_detachable_50m_capabilities"\nTRAINING_RECEIPT_KEY = "agillm5_detachable_50m_training_receipt"\nSIGNED_TRAINING_RECEIPT_KEY = (\n    "agillm5_detachable_50m_signed_training_receipt"\n)\nTRAINING_RECEIPT_SCHEMA = "agillm5.detachable-50m.multimode-training-receipt.v1"\nSIGNED_RECEIPT_SCHEMA = (\n    "agillm5.detachable-50m.signed-multimode-training-receipt.v1"\n)\nSIGNATURE_SCHEMA = "agillm5.detachable-50m.ed25519-signature.v1"\nSIGNATURE_KEY_ID = "det50-qualification-ed25519-v1-36d8f6e31dd27633"\nSIGNATURE_PUBLIC_DER_SHA256 = (\n    "36d8f6e31dd2763333dfbbefec19e7c3e825900b3929912a24bbfb13259714c2"\n)\nSIGNATURE_PUBLIC_PEM_BASE64 = (\n    "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQXhYSHJa"\n    "WEZSODFNVTFtSmx2bG1hZkduVnluOHNDZVF4cWJ5SHBvRXRnQ1U9Ci0tLS0tRU5E"\n    "IFBVQkxJQyBLRVktLS0tLQo="\n)\nCAPABILITY_SCHEMA = "agillm5.detachable-50m.capabilities.v1"\nDECODE_TELEMETRY_SCHEMA = "agillm.decode-telemetry.v1"\nRECEIPT_BINDING_SCHEMA = "agillm5.detachable-50m.checkpoint-binding.v1"\nEVALUATOR_SCHEMA = "agillm5.detachable-50m.heldout-evaluator.v1"\nMODES = ("ar", "sat_fixed", "sat_variable", "nat")\nDEFAULT_CYCLE = tuple(["ar"] * 16 + ["sat_fixed", "sat_variable"] + ["nat"] * 2)\n\n\ndef install(ns):\n    """Install the four-mode objective into one already-loaded v25 namespace."""\n    if ns.get("_DET50_MULTIMODE_V26_INSTALLED"):\n        return\n\n    import copy\n    import hashlib\n    import json\n    import math\n    import os\n    import pathlib\n    import re\n    import sys\n    import time\n\n    torch = ns["torch"]\n    nn = ns["nn"]\n    F = ns["F"]\n    BaseRuntime = ns["Detachable50MRuntime"]\n    base_schedule_from_args = ns["_det50_schedule_from_args"]\n    base_validate_schedule = ns["_det50_validate_schedule"]\n    base_apply_schedule = ns["_det50_apply_schedule_to_args"]\n    base_manifest = ns["_det50_manifest"]\n    base_validate_manifest = ns["_det50_validate_manifest"]\n    base_export_checkpoint = ns["export_detachable_50m_checkpoint"]\n\n    def default_multimode():\n        return {\n            "schema": MULTIMODE_SCHEMA,\n            # 16:1:1:2 preserves the mature trainer\'s 80/10/10 AR/SAT/NAT\n            # mixture while keeping SAT fixed and SAT-variable independent.\n            "cycle": list(DEFAULT_CYCLE),\n            "bootstrap_commits_per_mode": 128,\n            "mixture": {\n                "ar": 0.80, "sat_fixed": 0.05,\n                "sat_variable": 0.05, "nat": 0.10,\n            },\n            "token_loss_weights": {mode: 1.0 for mode in MODES},\n            "distill_multipliers": {\n                "ar": 1.0, "sat_fixed": 0.0,\n                "sat_variable": 0.0, "nat": 0.0,\n            },\n            "sat_fixed_block": 2,\n            "sat_variable_block": 2,\n            "sat_variable_gate_weight": 0.25,\n            "sat_variable_calibration_weight": 0.10,\n            "sat_variable_stride2_threshold": 0.999,\n            "sat_variable_class_weight_cap": 16.0,\n            "sat_variable_calibration_bins": 10,\n            "nat_mask_ratio": 0.50,\n            "nat_mask_token_id": 2,\n            "nat_refinement_steps": 2,\n            "nat_refinement_ratio_decay": 0.50,\n            "export_qualification": {\n                "min_gate_blocks": 512,\n                "min_each_gate_class": 32,\n                "max_gate_ece": 0.12,\n                "max_gate_brier": 0.24,\n                "require_both_gate_predictions": True,\n            },\n        }\n\n    def _parse_cycle(raw):\n        if isinstance(raw, str):\n            values = [part.strip().lower().replace("-", "_")\n                      for part in raw.split(",") if part.strip()]\n        elif isinstance(raw, (list, tuple)):\n            values = [str(part).strip().lower().replace("-", "_")\n                      for part in raw]\n        else:\n            values = []\n        return values or list(DEFAULT_CYCLE)\n\n    def validate_multimode(value):\n        if not isinstance(value, dict) or value.get("schema") != MULTIMODE_SCHEMA:\n            raise RuntimeError("detachable-50m multimode schedule schema is invalid")\n        value = copy.deepcopy(value)\n        cycle = _parse_cycle(value.get("cycle"))\n        if not cycle or set(cycle) != set(MODES) or any(mode not in MODES for mode in cycle):\n            raise RuntimeError("detachable-50m cycle must contain all four explicit modes")\n        value["cycle"] = cycle\n        counts = {mode: cycle.count(mode) for mode in MODES}\n        value["mixture"] = {mode: counts[mode] / float(len(cycle)) for mode in MODES}\n        bootstrap = int(value.get("bootstrap_commits_per_mode", 0))\n        if not 0 <= bootstrap <= 4096:\n            raise RuntimeError("invalid detachable-50m balanced bootstrap length")\n        value["bootstrap_commits_per_mode"] = bootstrap\n        for field in ("token_loss_weights", "distill_multipliers"):\n            weights = value.get(field)\n            if not isinstance(weights, dict) or set(weights) != set(MODES):\n                raise RuntimeError(f"detachable-50m {field} must name all four modes")\n            clean = {}\n            for mode in MODES:\n                scalar = float(weights[mode])\n                if not math.isfinite(scalar) or scalar < 0.0:\n                    raise RuntimeError(f"invalid detachable-50m {field}.{mode}")\n                clean[mode] = scalar\n            value[field] = clean\n        if value["distill_multipliers"]["ar"] <= 0.0:\n            raise RuntimeError("detachable-50m AR distillation must stay enabled")\n        if int(value.get("sat_fixed_block", -1)) != 2:\n            raise RuntimeError("SAT Fixed is immutable two-token draft/commit")\n        if int(value.get("sat_variable_block", -1)) != 2:\n            raise RuntimeError("SAT Variable gate is immutable 1-vs-2")\n        value["sat_fixed_block"] = value["sat_variable_block"] = 2\n        for key in ("sat_variable_gate_weight", "sat_variable_calibration_weight",\n                    "sat_variable_class_weight_cap",\n                    "nat_mask_ratio", "nat_refinement_ratio_decay"):\n            scalar = float(value.get(key, float("nan")))\n            if not math.isfinite(scalar) or scalar <= 0.0:\n                raise RuntimeError(f"invalid detachable-50m multimode {key}")\n            value[key] = scalar\n        threshold = float(value.get("sat_variable_stride2_threshold", float("nan")))\n        if not math.isfinite(threshold) or not 0.5 < threshold < 1.0:\n            raise RuntimeError("SAT Variable threshold must be between 0.5 and 1")\n        value["sat_variable_stride2_threshold"] = threshold\n        if value["sat_variable_class_weight_cap"] < 1.0:\n            raise RuntimeError("SAT Variable class-weight cap must be at least one")\n        if value["nat_mask_ratio"] > 1.0 or value["nat_refinement_ratio_decay"] > 1.0:\n            raise RuntimeError("NAT mask ratios cannot exceed one")\n        for key, lower, upper in (\n                ("sat_variable_calibration_bins", 2, 100),\n                ("nat_mask_token_id", 0, int(ns["_DET50_CONFIG"]["vocab_size"]) - 1),\n                ("nat_refinement_steps", 1, 8)):\n            raw = value.get(key)\n            if isinstance(raw, bool):\n                raise RuntimeError(f"invalid detachable-50m multimode {key}")\n            integer = int(raw)\n            if not lower <= integer <= upper:\n                raise RuntimeError(f"invalid detachable-50m multimode {key}")\n            value[key] = integer\n        qualification = value.get("export_qualification")\n        if not isinstance(qualification, dict):\n            raise RuntimeError("detachable-50m gate export qualification is missing")\n        expected_keys = {\n            "min_gate_blocks", "min_each_gate_class", "max_gate_ece",\n            "max_gate_brier", "require_both_gate_predictions",\n        }\n        if set(qualification) != expected_keys:\n            raise RuntimeError("detachable-50m gate export qualification changed")\n        qualification["min_gate_blocks"] = int(qualification["min_gate_blocks"])\n        qualification["min_each_gate_class"] = int(\n            qualification["min_each_gate_class"])\n        qualification["max_gate_ece"] = float(qualification["max_gate_ece"])\n        qualification["max_gate_brier"] = float(qualification["max_gate_brier"])\n        if (qualification["min_gate_blocks"] <= 0\n                or qualification["min_each_gate_class"] <= 0\n                or not 0.0 < qualification["max_gate_ece"] < 1.0\n                or not 0.0 < qualification["max_gate_brier"] < 1.0\n                or qualification["require_both_gate_predictions"] is not True):\n            raise RuntimeError("detachable-50m gate export qualification is invalid")\n        value["export_qualification"] = qualification\n        return value\n\n    def schedule_from_args(args):\n        schedule = base_schedule_from_args(args)\n        mm = default_multimode()\n        mm["cycle"] = _parse_cycle(getattr(\n            args, "detachable_50m_mode_cycle", ",".join(DEFAULT_CYCLE)))\n        mm["sat_variable_gate_weight"] = float(getattr(\n            args, "detachable_50m_sat_gate_weight", 0.25))\n        mm["sat_variable_calibration_weight"] = float(getattr(\n            args, "detachable_50m_sat_calibration_weight", 0.10))\n        mm["sat_variable_stride2_threshold"] = float(getattr(\n            args, "detachable_50m_sat_gate_threshold", 0.999))\n        mm["sat_variable_class_weight_cap"] = float(getattr(\n            args, "detachable_50m_sat_class_weight_cap", 16.0))\n        mm["nat_mask_ratio"] = float(getattr(\n            args, "detachable_50m_nat_mask_ratio", 0.50))\n        mm["nat_mask_token_id"] = int(getattr(\n            args, "detachable_50m_nat_mask_id", 2))\n        mm["nat_refinement_steps"] = int(getattr(\n            args, "detachable_50m_nat_refinement_steps", 2))\n        mm["distill_multipliers"]["sat_fixed"] = max(1.0, float(getattr(\n            args, "detachable_50m_sat_distill_multiplier", 1.0)))\n        mm["distill_multipliers"]["sat_variable"] = max(1.0, float(getattr(\n            args, "detachable_50m_sat_distill_multiplier", 1.0)))\n        mm["distill_multipliers"]["nat"] = max(1.0, float(getattr(\n            args, "detachable_50m_nat_distill_multiplier", 1.0)))\n        schedule["multimode"] = validate_multimode(mm)\n        return validate_schedule(schedule)\n\n    def validate_schedule(schedule):\n        # v1 schedules are accepted and promoted in memory.  Their signed\n        # manifest is checked before this normalization by validate_manifest.\n        schedule = base_validate_schedule(schedule)\n        schedule["multimode"] = validate_multimode(\n            schedule.get("multimode") or default_multimode())\n        return schedule\n\n    def apply_schedule(args, schedule):\n        schedule = validate_schedule(schedule)\n        base_apply_schedule(args, schedule)\n        mm = schedule["multimode"]\n        mm["distill_multipliers"]["sat_fixed"] = 1.0\n        mm["distill_multipliers"]["sat_variable"] = 1.0\n        mm["distill_multipliers"]["nat"] = 1.0\n        setattr(args, "detachable_50m_mode_cycle", ",".join(mm["cycle"]))\n        setattr(args, "detachable_50m_sat_gate_weight", mm["sat_variable_gate_weight"])\n        setattr(args, "detachable_50m_sat_calibration_weight",\n                mm["sat_variable_calibration_weight"])\n        setattr(args, "detachable_50m_sat_gate_threshold",\n                mm["sat_variable_stride2_threshold"])\n        setattr(args, "detachable_50m_sat_class_weight_cap",\n                mm["sat_variable_class_weight_cap"])\n        setattr(args, "detachable_50m_nat_mask_ratio", mm["nat_mask_ratio"])\n        setattr(args, "detachable_50m_nat_mask_id", mm["nat_mask_token_id"])\n        setattr(args, "detachable_50m_nat_refinement_steps", mm["nat_refinement_steps"])\n        setattr(args, "detachable_50m_sat_distill_multiplier",\n                mm["distill_multipliers"]["sat_fixed"])\n        setattr(args, "detachable_50m_nat_distill_multiplier",\n                mm["distill_multipliers"]["nat"])\n        return schedule\n\n    old_training_contract = {\n        "after_accepted_mature_dblock_only": True,\n        "objective": "direct_exact_streamed_ce_plus_normalized_hidden_cosine_distillation",\n        "vocab_ce": "exact_streamed",\n        "hidden_distillation": "normalized_mse_plus_cosine",\n        "effective_updates_require_teacher_packet": True,\n        "parent_weights_trainable": False,\n        "parent_routing_authority": False,\n    }\n    new_training_contract = {\n        "after_accepted_mature_dblock_only": True,\n        "objective": "four_mode_tied_projection_ar_sat_fixed_sat_variable_nat",\n        "objectives": {\n            "ar": "one_token_causal",\n            "sat_fixed": "two_token_fixed_draft_commit",\n            "sat_variable": "two_token_draft_plus_class_balanced_1_vs_2_gate",\n            "nat": "parallel_masked_bidirectional_refinement",\n        },\n        "vocab_ce": "exact_streamed",\n        "shared_tied_vocabulary_projection": True,\n        "hidden_distillation": "mode_weighted_normalized_mse_plus_cosine",\n        "hidden_distillation_modes": ["ar"],\n        "sat_pairing": "prompt_relative_phase_0_or_1_block_2",\n        "sat_pairing_sampling": "seeded_commit_balanced_retry_stable",\n        "sat_variable_gate_feature": "detached_final_fullstack_eval_hidden",\n        "effective_updates_require_teacher_packet": True,\n        "parent_weights_trainable": False,\n        "parent_routing_authority": False,\n    }\n\n    def manifest(optimizer_name, alibi_mode, alibi_scale, schedule):\n        value = base_manifest(optimizer_name, alibi_mode, alibi_scale,\n                              validate_schedule(schedule))\n        value["schema"] = MANIFEST_SCHEMA\n        value["phase"] = 2\n        value["bridge"]["export_sat_gate_trainable"] = True\n        value["training"] = copy.deepcopy(new_training_contract)\n        value.pop("manifest_sha256", None)\n        value["manifest_sha256"] = ns["_det50_json_sha256"](value)\n        return value\n\n    def validate_manifest(value):\n        if not isinstance(value, dict):\n            raise RuntimeError("detachable-50m manifest is missing")\n        raw = copy.deepcopy(value)\n        digest = str(raw.pop("manifest_sha256", "") or "")\n        if digest != ns["_det50_json_sha256"](raw):\n            raise RuntimeError("detachable-50m manifest digest mismatch")\n        gate_trainable = bool((value.get("bridge") or {}).get(\n            "export_sat_gate_trainable", False))\n        if not gate_trainable:\n            # Exact v1 validation remains authoritative for AR-only resumes.\n            validated = base_validate_manifest(value)\n            validated["schedule"] = validate_schedule(validated["schedule"])\n            return validated\n        compat = copy.deepcopy(value)\n        if (value.get("schema") != MANIFEST_SCHEMA\n                or int(value.get("phase", -1)) != 2):\n            raise RuntimeError("detachable-50m multimode manifest schema is invalid")\n        compat["schema"] = ns["_DET50_SCHEMA"]\n        compat["phase"] = 1\n        compat["bridge"]["export_sat_gate_trainable"] = False\n        compat["training"] = copy.deepcopy(old_training_contract)\n        compat.pop("manifest_sha256", None)\n        compat["manifest_sha256"] = ns["_det50_json_sha256"](compat)\n        checked = base_validate_manifest(compat)\n        if value.get("training") != new_training_contract:\n            raise RuntimeError("detachable-50m multimode training contract changed")\n        value = copy.deepcopy(value)\n        value["schedule"] = validate_schedule(checked["schedule"])\n        return value\n\n    def empty_gate_counters(bins=10):\n        return {\n            "blocks": 0, "stride1_labels": 0, "stride2_labels": 0,\n            "predicted_stride1": 0, "predicted_stride2": 0,\n            "correct": 0, "false_accepts": 0, "false_rejects": 0,\n            "brier_sum": 0.0, "probability_stride2_sum": 0.0,\n            "calibration_bins": [\n                {"count": 0, "probability_sum": 0.0, "label_sum": 0}\n                for _ in range(int(bins))\n            ],\n            "last_class_weights": [1.0, 1.0],\n            "last_threshold": 0.999,\n        }\n\n    def _zero_mode_counts():\n        return {mode: 0 for mode in MODES}\n\n    def _zero_sat_phase_counts():\n        return {\n            "sat_fixed": {\n                "phase_0_even_prompt": 0,\n                "phase_1_odd_prompt": 0,\n            },\n            "sat_variable": {\n                "phase_0_even_prompt": 0,\n                "phase_1_odd_prompt": 0,\n            },\n        }\n\n    def _qualification_snapshot(counters):\n        """Take an integer-only lifetime snapshot used for delta verification."""\n        return {\n            "parent_step": int(counters.get("last_parent_step", -1)),\n            "popup_attempts": int(counters.get("popup_attempts", 0)),\n            "popup_commits": int(counters.get("popup_commits", 0)),\n            "mode_attempts": {\n                mode: int(counters["mode_attempts"].get(mode, 0))\n                for mode in MODES\n            },\n            "mode_commits": {\n                mode: int(counters["mode_commits"].get(mode, 0))\n                for mode in MODES\n            },\n            "mode_error_skips": {\n                mode: int(counters["mode_error_skips"].get(mode, 0))\n                for mode in MODES\n            },\n            "mode_oom_skips": {\n                mode: int(counters["mode_oom_skips"].get(mode, 0))\n                for mode in MODES\n            },\n            "mode_overflow_skips": {\n                mode: int(counters["mode_overflow_skips"].get(mode, 0))\n                for mode in MODES\n            },\n            "sat_prompt_phase_commits": copy.deepcopy(\n                counters["sat_prompt_phase_commits"]\n            ),\n            "nat_refinement_passes": int(\n                counters.get("nat_refinement_passes", 0)\n            ),\n        }\n\n    def _post_fix_requirements():\n        return {\n            "fresh_commits_per_mode": dict(POST_FIX_REQUIRED_COMMITS),\n            "maximum_error_skips_per_mode": 0,\n            "maximum_oom_skips_per_mode": 0,\n            "maximum_overflow_skips_per_mode": 0,\n            "minimum_nat_refinement_passes": (\n                POST_FIX_REQUIRED_COMMITS["nat"] * 2\n            ),\n            "require_both_sat_prompt_phases": True,\n        }\n\n    def _validate_checkpoint_binding(value, label, allow_none=False):\n        fields = {\n            "schema", "source_checkpoint_sha256", "source_manifest_sha256",\n            "model_state_sha256", "sat_variable_gate_state_sha256",\n            "export_state_sha256", "parent_step", "student_popup_step",\n        }\n        if value is None and allow_none:\n            return\n        if (not isinstance(value, dict) or set(value) != fields\n                or value.get("schema") != RECEIPT_BINDING_SCHEMA):\n            raise RuntimeError(f"detachable-50m {label} binding is invalid")\n        for key in (\n            "source_checkpoint_sha256", "source_manifest_sha256",\n            "model_state_sha256", "sat_variable_gate_state_sha256",\n            "export_state_sha256",\n        ):\n            if not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")):\n                raise RuntimeError(\n                    f"detachable-50m {label}.{key} binding is invalid"\n                )\n        for key in ("parent_step", "student_popup_step"):\n            if type(value.get(key)) is not int or value[key] < 0:\n                raise RuntimeError(\n                    f"detachable-50m {label}.{key} binding is invalid"\n                )\n\n    def _validate_qualification_snapshot(value, label):\n        fields = {\n            "parent_step", "popup_attempts", "popup_commits",\n            "mode_attempts", "mode_commits", "mode_error_skips",\n            "mode_oom_skips", "mode_overflow_skips",\n            "sat_prompt_phase_commits", "nat_refinement_passes",\n        }\n        if not isinstance(value, dict) or set(value) != fields:\n            raise RuntimeError(f"detachable-50m {label} fields changed")\n        if type(value["parent_step"]) is not int or value["parent_step"] < -1:\n            raise RuntimeError(f"detachable-50m {label}.parent_step is invalid")\n        for field in (\n            "popup_attempts", "popup_commits", "nat_refinement_passes",\n        ):\n            if type(value[field]) is not int or value[field] < 0:\n                raise RuntimeError(f"detachable-50m {label}.{field} is invalid")\n        for field in (\n            "mode_attempts", "mode_commits", "mode_error_skips",\n            "mode_oom_skips", "mode_overflow_skips",\n        ):\n            row = value[field]\n            if not isinstance(row, dict) or set(row) != set(MODES):\n                raise RuntimeError(f"detachable-50m {label}.{field} changed")\n            if any(type(row[mode]) is not int or row[mode] < 0 for mode in MODES):\n                raise RuntimeError(f"detachable-50m {label}.{field} is invalid")\n        phases = value["sat_prompt_phase_commits"]\n        expected_phases = _zero_sat_phase_counts()\n        if not isinstance(phases, dict) or set(phases) != set(expected_phases):\n            raise RuntimeError(\n                f"detachable-50m {label}.sat_prompt_phase_commits changed"\n            )\n        for mode, expected in expected_phases.items():\n            row = phases.get(mode)\n            if not isinstance(row, dict) or set(row) != set(expected):\n                raise RuntimeError(\n                    f"detachable-50m {label}.sat_prompt_phase_commits.{mode} changed"\n                )\n            if any(type(row[key]) is not int or row[key] < 0 for key in expected):\n                raise RuntimeError(\n                    f"detachable-50m {label}.sat_prompt_phase_commits.{mode} is invalid"\n                )\n        if value["popup_attempts"] != sum(value["mode_attempts"].values()):\n            raise RuntimeError(\n                f"detachable-50m {label} popup/mode attempt totals disagree"\n            )\n        if value["popup_commits"] != sum(value["mode_commits"].values()):\n            raise RuntimeError(\n                f"detachable-50m {label} popup/mode commit totals disagree"\n            )\n        for mode in MODES:\n            attempts = value["mode_attempts"][mode]\n            outcomes = (\n                value["mode_commits"][mode]\n                + value["mode_error_skips"][mode]\n                + value["mode_oom_skips"][mode]\n                + value["mode_overflow_skips"][mode]\n            )\n            if outcomes != attempts:\n                raise RuntimeError(\n                    f"detachable-50m {label}.{mode} attempt outcomes disagree"\n                )\n        for mode in ("sat_fixed", "sat_variable"):\n            if (sum(value["sat_prompt_phase_commits"][mode].values())\n                    != value["mode_commits"][mode]):\n                raise RuntimeError(\n                    f"detachable-50m {label}.{mode} SAT phase totals disagree"\n                )\n\n    def _new_post_fix_qualification(counters, activation_binding=None):\n        _validate_checkpoint_binding(\n            activation_binding, "post_fix_activation", allow_none=True\n        )\n        return {\n            "schema": POST_FIX_QUALIFICATION_SCHEMA,\n            "fix_id": NAT_AUTOGRAD_FIX_ID,\n            "requirements": _post_fix_requirements(),\n            # This is immutable for the life of the v27 qualification epoch.\n            # It deliberately preserves the v26 lifetime error at attempt 7755.\n            "activated_lifetime": _qualification_snapshot(counters),\n            "activation_checkpoint_binding": copy.deepcopy(\n                activation_binding\n            ),\n            "window": None,\n            "qualified": False,\n            "reason": "post_fix_window_not_evaluated",\n        }\n\n    def _refresh_post_fix_qualification(counters, parent_step=None):\n        qualification = counters.get(POST_FIX_QUALIFICATION_KEY)\n        expected_qualification_fields = {\n            "schema", "fix_id", "requirements", "activated_lifetime",\n            "activation_checkpoint_binding", "window", "qualified", "reason",\n        }\n        if (not isinstance(qualification, dict)\n                or set(qualification) != expected_qualification_fields\n                or qualification.get("schema") != POST_FIX_QUALIFICATION_SCHEMA\n                or qualification.get("fix_id") != NAT_AUTOGRAD_FIX_ID\n                or qualification.get("requirements") != _post_fix_requirements()):\n            raise RuntimeError("detachable-50m post-fix qualification contract changed")\n        activated = qualification.get("activated_lifetime")\n        _validate_qualification_snapshot(activated, "activated_lifetime")\n        activation_binding = qualification.get("activation_checkpoint_binding")\n        _validate_checkpoint_binding(\n            activation_binding, "post_fix_activation", allow_none=True\n        )\n        current = _qualification_snapshot(counters)\n\n        def delta(field):\n            value = int(current[field]) - int(activated[field])\n            if value < 0:\n                raise RuntimeError(\n                    f"detachable-50m post-fix {field} lifetime counter regressed"\n                )\n            return value\n\n        def mode_delta(field):\n            result = {}\n            for mode in MODES:\n                value = int(current[field][mode]) - int(activated[field][mode])\n                if value < 0:\n                    raise RuntimeError(\n                        f"detachable-50m post-fix {field}.{mode} counter regressed"\n                    )\n                result[mode] = value\n            return result\n\n        phase_delta = _zero_sat_phase_counts()\n        for mode, row in phase_delta.items():\n            for key in row:\n                value = (\n                    int(current["sat_prompt_phase_commits"][mode][key])\n                    - int(activated["sat_prompt_phase_commits"][mode][key])\n                )\n                if value < 0:\n                    raise RuntimeError(\n                        "detachable-50m post-fix SAT phase counter regressed"\n                    )\n                row[key] = value\n        previous_window = qualification.get("window") or {}\n        end_parent_step = (\n            int(parent_step)\n            if parent_step is not None\n            else int(previous_window.get(\n                "end_parent_step", current.get("parent_step", -1)\n            ))\n        )\n        window = {\n            "start_parent_step": int(activated["parent_step"]),\n            "end_parent_step": end_parent_step,\n            "popup_attempts": delta("popup_attempts"),\n            "popup_commits": delta("popup_commits"),\n            "mode_attempts": mode_delta("mode_attempts"),\n            "mode_commits": mode_delta("mode_commits"),\n            "mode_error_skips": mode_delta("mode_error_skips"),\n            "mode_oom_skips": mode_delta("mode_oom_skips"),\n            "mode_overflow_skips": mode_delta("mode_overflow_skips"),\n            "sat_prompt_phase_commits": phase_delta,\n            "nat_refinement_passes": delta("nat_refinement_passes"),\n        }\n        _validate_qualification_snapshot({\n            "parent_step": window["end_parent_step"],\n            "popup_attempts": window["popup_attempts"],\n            "popup_commits": window["popup_commits"],\n            "mode_attempts": window["mode_attempts"],\n            "mode_commits": window["mode_commits"],\n            "mode_error_skips": window["mode_error_skips"],\n            "mode_oom_skips": window["mode_oom_skips"],\n            "mode_overflow_skips": window["mode_overflow_skips"],\n            "sat_prompt_phase_commits": window["sat_prompt_phase_commits"],\n            "nat_refinement_passes": window["nat_refinement_passes"],\n        }, "post_fix_window")\n        requirements = qualification["requirements"]\n        failures = []\n        if activation_binding is None:\n            failures.append("activation_checkpoint_binding_missing")\n        for field, label in (\n            ("mode_error_skips", "error"),\n            ("mode_oom_skips", "oom"),\n            ("mode_overflow_skips", "overflow"),\n        ):\n            maximum = int(requirements[f"maximum_{label}_skips_per_mode"])\n            for mode in MODES:\n                if int(window[field][mode]) > maximum:\n                    failures.append(f"{mode}_{label}_delta_nonzero")\n        for mode in MODES:\n            required = int(requirements["fresh_commits_per_mode"][mode])\n            if int(window["mode_commits"][mode]) < required:\n                failures.append(f"{mode}_fresh_commits_below_{required}")\n        if int(window["nat_refinement_passes"]) < int(\n            requirements["minimum_nat_refinement_passes"]\n        ):\n            failures.append("nat_refinement_passes_below_minimum")\n        if requirements["require_both_sat_prompt_phases"] is True:\n            for mode in ("sat_fixed", "sat_variable"):\n                if any(\n                    int(window["sat_prompt_phase_commits"][mode][phase]) <= 0\n                    for phase in (\n                        "phase_0_even_prompt", "phase_1_odd_prompt",\n                    )\n                ):\n                    failures.append(f"{mode}_prompt_phase_not_observed")\n        qualification["window"] = window\n        qualification["qualified"] = not failures\n        qualification["reason"] = "qualified" if not failures else failures[0]\n        counters[POST_FIX_QUALIFICATION_KEY] = qualification\n        return copy.deepcopy(qualification)\n\n    def migrate_counters(counters, bins=10, activation_binding=None):\n        if not isinstance(counters, dict):\n            raise RuntimeError("detachable-50m counters are invalid")\n        counters = copy.deepcopy(counters)\n        schema = counters.get("schema")\n        if schema not in {\n            "agillm5.detachable-50m.counters.v1",\n            PREVIOUS_COUNTERS_SCHEMA,\n            COUNTERS_SCHEMA,\n        }:\n            raise RuntimeError("detachable-50m counters are invalid")\n        legacy_ar_only = schema == "agillm5.detachable-50m.counters.v1"\n        has_post_fix_window = schema == COUNTERS_SCHEMA\n        if (type(counters.get("popup_attempts", 0)) is not int\n                or type(counters.get("popup_commits", 0)) is not int\n                or type(counters.get("last_parent_step", -1)) is not int):\n            raise RuntimeError(\n                "detachable-50m lifetime clocks must be exact integers"\n            )\n        old_attempts = int(counters.get("popup_attempts", 0))\n        old_commits = int(counters.get("popup_commits", 0))\n        if old_attempts < 0 or old_commits < 0 or old_commits > old_attempts:\n            raise RuntimeError("detachable-50m lifetime clocks are inconsistent")\n        counters["schema"] = COUNTERS_SCHEMA\n        counters.setdefault("mode_attempts", {mode: 0 for mode in MODES})\n        counters.setdefault("mode_commits", {mode: 0 for mode in MODES})\n        counters.setdefault("mode_overflow_skips", {mode: 0 for mode in MODES})\n        counters.setdefault("mode_oom_skips", {mode: 0 for mode in MODES})\n        counters.setdefault("mode_error_skips", {mode: 0 for mode in MODES})\n        counters.setdefault("mode_target_tokens", {mode: 0 for mode in MODES})\n        counters.setdefault("mode_loss_sums", {\n            mode: {"token_ce": 0.0, "distill": 0.0, "combined": 0.0}\n            for mode in MODES\n        })\n        for field in ("mode_attempts", "mode_commits", "mode_overflow_skips",\n                      "mode_oom_skips", "mode_error_skips", "mode_target_tokens"):\n            values = counters[field]\n            if not isinstance(values, dict):\n                raise RuntimeError(f"detachable-50m {field} must be a mapping")\n            if (not legacy_ar_only and set(values) != set(MODES)):\n                raise RuntimeError(f"detachable-50m {field} mode keys changed")\n            for mode in MODES:\n                if (not legacy_ar_only\n                        and type(values.get(mode)) is not int):\n                    raise RuntimeError(\n                        f"detachable-50m {field}.{mode} must be an exact integer"\n                    )\n                values[mode] = int(values.get(mode, 0))\n                if values[mode] < 0:\n                    raise RuntimeError(f"negative detachable-50m {field}.{mode}")\n        for mode in MODES:\n            losses = counters["mode_loss_sums"].setdefault(mode, {})\n            for key in ("token_ce", "distill", "combined"):\n                losses[key] = float(losses.get(key, 0.0))\n        if legacy_ar_only:\n            # Every historical v1 popup update was causal AR.\n            counters["mode_attempts"]["ar"] = old_attempts\n            counters["mode_commits"]["ar"] = old_commits\n            remaining = old_attempts - old_commits\n            legacy_oom = min(\n                remaining, max(0, int(counters.get("popup_oom_skips", 0)))\n            )\n            remaining -= legacy_oom\n            legacy_overflow = min(\n                remaining,\n                max(0, int(counters.get("popup_overflow_skips", 0))),\n            )\n            remaining -= legacy_overflow\n            counters["mode_oom_skips"]["ar"] = legacy_oom\n            counters["mode_overflow_skips"]["ar"] = legacy_overflow\n            counters["mode_error_skips"]["ar"] = remaining\n            counters["resume_migration"] = {\n                "schema": "agillm5.detachable-50m.resume-migration.v1",\n                "from": "ar_only_v1", "to": "four_mode_v2",\n                "historical_attempts_classified_as_ar": old_attempts,\n                "historical_commits_classified_as_ar": old_commits,\n                "historical_unclassified_skips_classified_as_error": remaining,\n                "gate_optimizer_state": "fresh",\n            }\n        gate = counters.get("sat_variable_gate")\n        if not isinstance(gate, dict):\n            gate = empty_gate_counters(bins)\n        if len(gate.get("calibration_bins") or []) != int(bins):\n            gate["calibration_bins"] = empty_gate_counters(bins)["calibration_bins"]\n        counters["sat_variable_gate"] = gate\n        counters.setdefault("nat_masked_tokens", 0)\n        counters.setdefault("nat_refinement_passes", 0)\n        if (not legacy_ar_only\n                and type(counters["nat_refinement_passes"]) is not int):\n            raise RuntimeError(\n                "detachable-50m nat_refinement_passes must be an exact integer"\n            )\n        counters["nat_refinement_passes"] = int(\n            counters["nat_refinement_passes"]\n        )\n        if counters["nat_refinement_passes"] < 0:\n            raise RuntimeError("negative detachable-50m nat_refinement_passes")\n        phase_counts = counters.setdefault(\n            "sat_prompt_phase_commits", _zero_sat_phase_counts()\n        )\n        if (not isinstance(phase_counts, dict)\n                or (not legacy_ar_only\n                    and set(phase_counts) != {"sat_fixed", "sat_variable"})):\n            raise RuntimeError(\n                "detachable-50m sat_prompt_phase_commits changed"\n            )\n        for mode in ("sat_fixed", "sat_variable"):\n            row = phase_counts.setdefault(mode, {})\n            if (not isinstance(row, dict)\n                    or (not legacy_ar_only and set(row) != {\n                        "phase_0_even_prompt", "phase_1_odd_prompt",\n                    })):\n                raise RuntimeError(\n                    f"detachable-50m sat_prompt_phase_commits.{mode} changed"\n                )\n            for name in ("phase_0_even_prompt", "phase_1_odd_prompt"):\n                if (not legacy_ar_only and type(row.get(name)) is not int):\n                    raise RuntimeError(\n                        "detachable-50m sat prompt phase must be an exact integer"\n                    )\n                row[name] = int(row.get(name, 0))\n                if row[name] < 0:\n                    raise RuntimeError(\n                        f"negative detachable-50m sat_prompt_phase_commits.{mode}.{name}")\n        counters.setdefault("last_popup_mode", None)\n        if has_post_fix_window:\n            if activation_binding is not None:\n                raise RuntimeError(\n                    "detachable-50m v3 resume cannot replace activation binding"\n                )\n            qualification = counters.get(POST_FIX_QUALIFICATION_KEY)\n            if (not isinstance(qualification, dict)\n                    or qualification.get("schema")\n                    != POST_FIX_QUALIFICATION_SCHEMA\n                    or qualification.get("fix_id") != NAT_AUTOGRAD_FIX_ID):\n                raise RuntimeError(\n                    "detachable-50m v3 counters lack the exact post-fix window"\n                )\n        else:\n            counters[POST_FIX_QUALIFICATION_KEY] = (\n                _new_post_fix_qualification(counters, activation_binding)\n            )\n        _refresh_post_fix_qualification(counters)\n        return counters\n\n    def _gate_class_weights(counters, cap):\n        gate = counters["sat_variable_gate"]\n        stride1 = max(0, int(gate.get("stride1_labels", 0)))\n        stride2 = max(0, int(gate.get("stride2_labels", 0)))\n        if stride1 <= 0 or stride2 <= 0:\n            return [1.0, 1.0]\n        total = float(stride1 + stride2)\n        return [\n            min(float(cap), max(0.25, total / (2.0 * stride1))),\n            min(float(cap), max(0.25, total / (2.0 * stride2))),\n        ]\n\n    def _valid_receipt_id(value):\n        return bool(isinstance(value, str)\n                    and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", value))\n\n    def _receipt_int(value, name, minimum=0):\n        if type(value) is not int or int(value) < int(minimum):\n            raise RuntimeError(f"detachable-50m {name} must be an integer >= {minimum}")\n        return int(value)\n\n    def _receipt_number(value, name):\n        if (isinstance(value, bool) or not isinstance(value, (int, float))\n                or not math.isfinite(float(value)) or float(value) < 0.0):\n            raise RuntimeError(\n                f"detachable-50m {name} must be a finite nonnegative number")\n        return float(value)\n\n    def _state_dict_sha256(state):\n        """Canonical tensor-state digest used by the external held-out receipt."""\n        if not isinstance(state, dict) or not state:\n            raise RuntimeError("detachable-50m receipt state binding is missing")\n        digest = hashlib.sha256()\n        for name in sorted(state):\n            tensor = state[name]\n            if not isinstance(name, str) or not torch.is_tensor(tensor):\n                raise RuntimeError("detachable-50m receipt state binding is malformed")\n            raw = tensor.detach().to(device="cpu").contiguous()\n            digest.update(name.encode("utf-8") + b"\\0")\n            digest.update(str(raw.dtype).encode("ascii") + b"\\0")\n            digest.update(json.dumps(list(raw.shape), separators=(",", ":")).encode("ascii"))\n            digest.update(b"\\0")\n            digest.update(raw.view(torch.uint8).numpy().tobytes(order="C"))\n        return digest.hexdigest()\n\n    def _export_state_sha256(model_state, bridge_state):\n        """Frozen loader-compatible digest of core plus learned SAT gate."""\n        if sys.byteorder != "little":\n            raise RuntimeError("detachable-50m export digest requires little-endian host")\n        if not isinstance(model_state, dict) or not isinstance(bridge_state, dict):\n            raise RuntimeError("detachable-50m export digest state is missing")\n        named = {f"core.{name}": tensor for name, tensor in model_state.items()}\n        named["sat.gate.weight"] = bridge_state.get("export_sat_gate.weight")\n        named["sat.gate.bias"] = bridge_state.get("export_sat_gate.bias")\n        digest = hashlib.sha256(b"agillm5.det50.export-state-sha256.v1\\0")\n        for name in sorted(named):\n            tensor = named[name]\n            if not torch.is_tensor(tensor) or tensor.layout != torch.strided:\n                raise RuntimeError("detachable-50m export digest requires dense tensors")\n            value = tensor.detach().to(device="cpu").contiguous()\n            header = json.dumps({\n                "name": name,\n                "dtype": str(value.dtype).removeprefix("torch."),\n                "shape": list(value.shape),\n            }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")\n            raw = value.view(torch.uint8).numpy().tobytes(order="C")\n            digest.update(len(header).to_bytes(8, "big", signed=False))\n            digest.update(header)\n            digest.update(len(raw).to_bytes(8, "big", signed=False))\n            digest.update(raw)\n        return digest.hexdigest()\n\n    def receipt_binding(source_checkpoint_sha256, source_manifest, model_state,\n                        bridge_state, counters):\n        source_digest = str(source_checkpoint_sha256 or "")\n        if not re.fullmatch(r"[0-9a-f]{64}", source_digest):\n            raise RuntimeError("detachable-50m source checkpoint digest is invalid")\n        manifest_digest = str((source_manifest or {}).get("manifest_sha256") or "")\n        if not re.fullmatch(r"[0-9a-f]{64}", manifest_digest):\n            raise RuntimeError("detachable-50m source manifest digest is invalid")\n        model_digest = _state_dict_sha256(model_state)\n        gate_state = {\n            "export_sat_gate.weight": (bridge_state or {}).get(\n                "export_sat_gate.weight"),\n            "export_sat_gate.bias": (bridge_state or {}).get(\n                "export_sat_gate.bias"),\n        }\n        gate_digest = _state_dict_sha256(gate_state)\n        export_digest = _export_state_sha256(model_state, bridge_state)\n        return {\n            "schema": RECEIPT_BINDING_SCHEMA,\n            "source_checkpoint_sha256": source_digest,\n            "source_manifest_sha256": manifest_digest,\n            "model_state_sha256": model_digest,\n            "sat_variable_gate_state_sha256": gate_digest,\n            "export_state_sha256": export_digest,\n            "parent_step": int((counters or {}).get("last_parent_step", -1)),\n            "student_popup_step": int((counters or {}).get("popup_commits", -1)),\n        }\n\n    def _strict_json_object(pairs):\n        """Reject duplicate object keys at every level of signed JSON input."""\n        result = {}\n        for key, value in pairs:\n            if key in result:\n                raise RuntimeError(\n                    f"detachable-50m signed receipt has duplicate JSON key: {key}"\n                )\n            result[key] = value\n        return result\n\n    def _strict_json_load(handle):\n        try:\n            return json.load(handle, object_pairs_hook=_strict_json_object)\n        except RuntimeError:\n            raise\n        except (TypeError, ValueError, json.JSONDecodeError) as exc:\n            raise RuntimeError(\n                "detachable-50m signed receipt JSON is malformed"\n            ) from exc\n\n    def _canonical_signed_receipt_bytes(receipt):\n        if not isinstance(receipt, dict):\n            raise RuntimeError(\n                "detachable-50m signed receipt payload is not an object"\n            )\n        try:\n            return json.dumps(\n                receipt, sort_keys=True, separators=(",", ":"),\n                ensure_ascii=False, allow_nan=False,\n            ).encode("utf-8")\n        except (TypeError, ValueError, UnicodeError) as exc:\n            raise RuntimeError(\n                "detachable-50m signed receipt payload is not canonicalizable"\n            ) from exc\n\n    def validate_signed_training_receipt_envelope(envelope):\n        """Authenticate a receipt before any qualification verdict is read."""\n        if (not isinstance(envelope, dict)\n                or set(envelope) != {"schema", "receipt", "signature"}\n                or envelope.get("schema") != SIGNED_RECEIPT_SCHEMA):\n            raise RuntimeError(\n                "detachable-50m signed training receipt envelope is invalid"\n            )\n        receipt = envelope.get("receipt")\n        signature = envelope.get("signature")\n        expected_signature_fields = {\n            "schema", "algorithm", "key_id", "public_key_der_sha256",\n            "signed_payload_sha256", "signature_base64",\n        }\n        if (not isinstance(signature, dict)\n                or set(signature) != expected_signature_fields\n                or signature.get("schema") != SIGNATURE_SCHEMA\n                or signature.get("algorithm") != "Ed25519"\n                or signature.get("key_id") != SIGNATURE_KEY_ID\n                or signature.get("public_key_der_sha256")\n                != SIGNATURE_PUBLIC_DER_SHA256):\n            raise RuntimeError(\n                "detachable-50m training receipt signature contract is invalid"\n            )\n\n        # Hash and authenticate exactly the canonical UTF-8 receipt object.\n        # Receipt verdict/binding fields are deliberately untouched until the\n        # Ed25519 verification below succeeds.\n        payload = _canonical_signed_receipt_bytes(receipt)\n        payload_digest = hashlib.sha256(payload).hexdigest()\n        if signature.get("signed_payload_sha256") != payload_digest:\n            raise RuntimeError(\n                "detachable-50m training receipt signed payload digest mismatch"\n            )\n        encoded_signature = signature.get("signature_base64")\n        if not isinstance(encoded_signature, str):\n            raise RuntimeError(\n                "detachable-50m training receipt signature is malformed"\n            )\n        try:\n            signature_bytes = base64.b64decode(\n                encoded_signature.encode("ascii"), validate=True)\n        except (UnicodeError, ValueError) as exc:\n            raise RuntimeError(\n                "detachable-50m training receipt signature is malformed"\n            ) from exc\n        if (len(signature_bytes) != 64\n                or base64.b64encode(signature_bytes).decode("ascii")\n                != encoded_signature):\n            raise RuntimeError(\n                "detachable-50m training receipt signature is not canonical"\n            )\n\n        try:\n            from cryptography.exceptions import InvalidSignature\n            from cryptography.hazmat.primitives import serialization\n            from cryptography.hazmat.primitives.asymmetric.ed25519 import (\n                Ed25519PublicKey,\n            )\n        except ImportError as exc:\n            raise RuntimeError(\n                "detachable-50m receipt signature verifier is unavailable"\n            ) from exc\n        try:\n            public_pem = base64.b64decode(\n                SIGNATURE_PUBLIC_PEM_BASE64.encode("ascii"), validate=True)\n            public_key = serialization.load_pem_public_key(public_pem)\n            if not isinstance(public_key, Ed25519PublicKey):\n                raise RuntimeError(\n                    "detachable-50m pinned receipt public key is not Ed25519"\n                )\n            public_der = public_key.public_bytes(\n                encoding=serialization.Encoding.DER,\n                format=serialization.PublicFormat.SubjectPublicKeyInfo,\n            )\n            if hashlib.sha256(public_der).hexdigest() != SIGNATURE_PUBLIC_DER_SHA256:\n                raise RuntimeError(\n                    "detachable-50m pinned receipt public key digest mismatch"\n                )\n            public_key.verify(signature_bytes, payload)\n        except InvalidSignature as exc:\n            raise RuntimeError(\n                "detachable-50m training receipt Ed25519 signature is invalid"\n            ) from exc\n        except RuntimeError:\n            raise\n        except (TypeError, ValueError) as exc:\n            raise RuntimeError(\n                "detachable-50m receipt signature verifier is invalid"\n            ) from exc\n        return copy.deepcopy(receipt)\n\n    def validate_training_receipt(receipt, counters, multimode, expected_binding):\n        if not isinstance(receipt, dict) or receipt.get("schema") != TRAINING_RECEIPT_SCHEMA:\n            raise RuntimeError("detachable-50m multimode training receipt is missing")\n        receipt = copy.deepcopy(receipt)\n        digest = str(receipt.pop("receipt_sha256", "") or "")\n        if digest != hashlib.sha256(\n            _canonical_signed_receipt_bytes(receipt)\n        ).hexdigest():\n            raise RuntimeError("detachable-50m training receipt digest mismatch")\n        receipt["receipt_sha256"] = digest\n        if receipt.get("checkpoint_binding") != expected_binding:\n            raise RuntimeError("detachable-50m receipt is stale or bound to different weights")\n        native_qualification = _refresh_post_fix_qualification(counters)\n        if native_qualification.get("qualified") is not True:\n            raise RuntimeError(\n                "detachable-50m post-fix qualification window is incomplete: "\n                + str(native_qualification.get("reason") or "unknown")\n            )\n        receipt_window = receipt.get("qualification_window")\n        expected_window_fields = {\n            "schema", "fix_id", "passed", "failures",\n            "start_checkpoint_binding", "end_checkpoint_binding",\n            "lifetime_start", "lifetime_end",\n            "fresh_mode_attempts", "fresh_mode_commits",\n            "fresh_mode_error_skips", "fresh_mode_oom_skips",\n            "fresh_mode_overflow_skips", "fresh_sat_prompt_phase_commits",\n            "fresh_nat_refinement_passes",\n        }\n        if (not isinstance(receipt_window, dict)\n                or set(receipt_window) != expected_window_fields\n                or receipt_window.get("schema") != QUALIFICATION_WINDOW_SCHEMA\n                or receipt_window.get("fix_id") != NAT_AUTOGRAD_FIX_ID\n                or receipt_window.get("passed") is not True\n                or receipt_window.get("failures") != []):\n            raise RuntimeError(\n                "detachable-50m receipt qualification window is invalid"\n            )\n        start_binding = receipt_window.get("start_checkpoint_binding")\n        _validate_checkpoint_binding(start_binding, "qualification_start")\n        if start_binding != native_qualification.get(\n                "activation_checkpoint_binding"):\n            raise RuntimeError(\n                "detachable-50m qualification start binding does not match "\n                "the immutable v2->v3 activation binding"\n            )\n        activated = native_qualification["activated_lifetime"]\n        if (int(start_binding["parent_step"]) != int(activated["parent_step"])\n                or int(start_binding["student_popup_step"])\n                != int(activated["popup_commits"])):\n            raise RuntimeError(\n                "detachable-50m qualification start binding clock mismatch"\n            )\n        if receipt_window.get("end_checkpoint_binding") != expected_binding:\n            raise RuntimeError(\n                "detachable-50m qualification end binding is stale"\n            )\n        current_lifetime = _qualification_snapshot(counters)\n        if (receipt_window.get("lifetime_start") != activated\n                or receipt_window.get("lifetime_end") != current_lifetime):\n            raise RuntimeError(\n                "detachable-50m qualification lifetime snapshots are stale"\n            )\n        native_window = native_qualification["window"]\n        for receipt_key, native_key in (\n            ("fresh_mode_attempts", "mode_attempts"),\n            ("fresh_mode_commits", "mode_commits"),\n            ("fresh_mode_error_skips", "mode_error_skips"),\n            ("fresh_mode_oom_skips", "mode_oom_skips"),\n            ("fresh_mode_overflow_skips", "mode_overflow_skips"),\n            ("fresh_sat_prompt_phase_commits", "sat_prompt_phase_commits"),\n            ("fresh_nat_refinement_passes", "nat_refinement_passes"),\n        ):\n            if receipt_window.get(receipt_key) != native_window[native_key]:\n                raise RuntimeError(\n                    f"detachable-50m qualification {receipt_key} delta mismatch"\n                )\n        evaluator = receipt.get("evaluator_contract") or {}\n        if (evaluator.get("schema") != EVALUATOR_SCHEMA\n                or evaluator.get("thresholds_frozen_before_evaluation") is not True\n                or str(evaluator.get("split") or "") != "heldout"\n                or any(not re.fullmatch(r"[0-9a-f]{64}", str(\n                    evaluator.get(key) or "")) for key in (\n                        "evaluator_sha256", "dataset_sha256",\n                        "evaluation_config_sha256"))):\n            raise RuntimeError("detachable-50m held-out evaluator contract is invalid")\n        bootstrap = int(multimode["bootstrap_commits_per_mode"])\n        committed = receipt.get("committed_objective_updates") or {}\n        live_committed = (counters or {}).get("mode_commits") or {}\n        for mode in MODES:\n            if int(live_committed.get(mode, -1)) < bootstrap:\n                raise RuntimeError(f"detachable-50m {mode} lacks balanced bootstrap commits")\n        for mode in MODES:\n            count = committed.get(mode)\n            if (type(count) is not int or int(count) < bootstrap\n                    or int(count) != int(live_committed.get(mode, -1))):\n                raise RuntimeError(\n                    f"detachable-50m {mode} receipt commit count is stale")\n        heldout = receipt.get("heldout_validation") or {}\n        receipt_ids = []\n        for mode in MODES:\n            row = heldout.get(mode) or {}\n            receipt_id = row.get("receipt_id")\n            if not _valid_receipt_id(receipt_id):\n                raise RuntimeError(f"detachable-50m heldout {mode} receipt ID is invalid")\n            receipt_ids.append(receipt_id)\n            tokens = _receipt_int(row.get("tokens"), f"heldout {mode} tokens", 4096)\n            cross_entropy = _receipt_number(\n                row.get("cross_entropy"), f"heldout {mode} cross_entropy")\n            maximum = _receipt_number(\n                row.get("maximum_cross_entropy"),\n                f"heldout {mode} maximum_cross_entropy")\n            baseline = _receipt_number(\n                row.get("baseline_cross_entropy"),\n                f"heldout {mode} baseline_cross_entropy")\n            if (row.get("passed") is not True\n                    or tokens < 4096 or not cross_entropy <= maximum <= baseline):\n                raise RuntimeError(f"detachable-50m heldout {mode} CE threshold failed")\n        if len(set(receipt_ids)) != len(receipt_ids):\n            raise RuntimeError("detachable-50m per-mode receipt IDs must be distinct")\n        sat_fixed = heldout["sat_fixed"]\n        if (sat_fixed.get("fixed_pair_contract_passed") is not True\n                or sat_fixed.get("prompt_relative_pairing_contract_passed") is not True\n                or _receipt_int(sat_fixed.get("odd_prompt_cases"),\n                                "SAT Fixed odd_prompt_cases", 32) < 32\n                or _receipt_int(sat_fixed.get("even_prompt_cases"),\n                                "SAT Fixed even_prompt_cases", 32) < 32):\n            raise RuntimeError("detachable-50m SAT Fixed pair contract failed")\n        sat_variable = heldout["sat_variable"]\n        gate = sat_variable.get("gate_census") or {}\n        labels1 = _receipt_int(gate.get("label_stride1"), "gate label_stride1")\n        labels2 = _receipt_int(gate.get("label_stride2"), "gate label_stride2")\n        predictions1 = _receipt_int(gate.get("stride1"), "gate stride1")\n        predictions2 = _receipt_int(gate.get("stride2"), "gate stride2")\n        rows = _receipt_int(gate.get("rows"), "gate rows", 512)\n        balanced_accuracy = _receipt_number(\n            gate.get("balanced_accuracy"), "gate balanced_accuracy")\n        ece = _receipt_number(gate.get("ece"), "gate ece")\n        brier = _receipt_number(gate.get("brier"), "gate brier")\n        false_accept_rate = _receipt_number(\n            gate.get("false_accept_rate"), "gate false_accept_rate")\n        threshold = _receipt_number(gate.get("threshold"), "gate threshold")\n        if (sat_variable.get("realignment_contract_passed") is not True\n                or sat_variable.get("prompt_relative_pairing_contract_passed") is not True\n                or _receipt_int(sat_variable.get("odd_prompt_cases"),\n                                "SAT Variable odd_prompt_cases", 32) < 32\n                or _receipt_int(sat_variable.get("even_prompt_cases"),\n                                "SAT Variable even_prompt_cases", 32) < 32\n                or rows < 512 or predictions1 + predictions2 != rows\n                or labels1 + labels2 != rows or min(labels1, labels2) < 32\n                or min(predictions1, predictions2) <= 0\n                or balanced_accuracy < 0.55 or ece > 0.12\n                or brier > 0.24 or false_accept_rate > 0.05\n                or gate.get("collapsed") is not False\n                or abs(threshold - float(\n                    multimode["sat_variable_stride2_threshold"])) > 1e-12):\n            raise RuntimeError("detachable-50m SAT-variable gate did not qualify")\n        throughput = receipt.get("throughput_benchmark") or {}\n        throughput_id = throughput.get("receipt_id")\n        generated = throughput.get("generated_tokens") or {}\n        prompt_count = _receipt_int(\n            throughput.get("prompt_count"), "throughput prompt_count", 32)\n        if (not _valid_receipt_id(throughput_id)\n                or throughput_id in receipt_ids\n                or throughput.get("passed") is not True\n                or prompt_count < 32\n                or any(_receipt_int(generated.get(mode),\n                                    f"throughput generated_tokens.{mode}", 512) < 512\n                       for mode in ("ar", "sat_variable", "sat_fixed"))):\n            raise RuntimeError("detachable-50m throughput census is invalid")\n        rates = throughput.get("tokens_per_second") or {}\n        ar_rate = _receipt_number(rates.get("ar"), "throughput AR rate")\n        variable_rate = _receipt_number(\n            rates.get("sat_variable"), "throughput SAT Variable rate")\n        fixed_rate = _receipt_number(\n            rates.get("sat_fixed"), "throughput SAT Fixed rate")\n        if not (0.0 < ar_rate < variable_rate < fixed_rate):\n            raise RuntimeError("SAT Variable throughput is not between AR and SAT Fixed")\n        nat = heldout["nat"]\n        if (nat.get("clean_prefix_masked_suffix") is not True\n                or _receipt_int(nat.get("refinement_passes"),\n                                "NAT refinement_passes", 2) < 2):\n            raise RuntimeError("detachable-50m NAT refinement did not qualify")\n        return receipt\n\n    def capabilities(training_receipt=None, multimode=None):\n        trained = isinstance(training_receipt, dict)\n        modes = {\n            "ar": {\n                "inference": True, "training": True, "trained": False,\n                "objective": "causal_shift_1",\n                "status": "current_multimode_weights_require_heldout_receipt",\n                "state_binding": "core+tied_vocab:causal_shift_1",\n                "telemetry_contract": DECODE_TELEMETRY_SCHEMA,\n            },\n            "sat_fixed": {\n                "inference": True, "training": True, "trained": False,\n                "objective": "sat_block_2_shift_2",\n                "status": "executable_shared_weights_requires_sat_training",\n                "state_binding": "core+tied_vocab:sat_block_2_shift_2",\n                "telemetry_contract": DECODE_TELEMETRY_SCHEMA,\n            },\n            "sat_variable": {\n                "inference": True, "training": True, "trained": False,\n                "objective": "sat_fixed_plus_learned_stride_1_or_2_gate",\n                "status": "unverified_gate_requires_training_receipt",\n                "state_binding": "core+tied_vocab+sat.gate:sat_variable_stride",\n                "telemetry_contract": DECODE_TELEMETRY_SCHEMA,\n            },\n            "nat": {\n                "inference": True, "training": True, "trained": False,\n                "objective": "masked_bidirectional_denoising",\n                "status": "executable_tied_head_requires_nat_training",\n                "state_binding": "core+tied_vocab:nat_bidirectional_masked_suffix",\n                "telemetry_contract": DECODE_TELEMETRY_SCHEMA,\n            },\n        }\n        if trained:\n            heldout = training_receipt["heldout_validation"]\n            committed = training_receipt["committed_objective_updates"]\n            for mode in MODES:\n                modes[mode].update({\n                    "trained": True,\n                    "status": "trained_and_heldout_validated",\n                    "committed_updates": int(committed[mode]),\n                    "training_receipt_id": str(heldout[mode]["receipt_id"]),\n                })\n        return {\n            "schema": CAPABILITY_SCHEMA,\n            "source_schema": "agillm5.detachable-50m.ar-export.v1",\n            "modes": modes,\n        }\n\n    class MultimodeRuntime(BaseRuntime):\n        def __init__(self, args, mature_d, device):\n            super().__init__(args, mature_d, device)\n            schedule = self.manifest["schedule"]\n            lr, wd = float(schedule["optimizer_lr"]), float(schedule["weight_decay"])\n            gate_parameters = list(self.bridge.export_sat_gate.parameters())\n            # Dormant v1 gate values were random and never trained.  A staged\n            # v2 starts from the deterministic neutral logits [0, 0].\n            nn.init.zeros_(self.bridge.export_sat_gate.weight)\n            nn.init.zeros_(self.bridge.export_sat_gate.bias)\n            self.optimizer.param_groups[0]["role"] = "student_and_teacher_projection"\n            self.optimizer.add_param_group({\n                "params": gate_parameters, "lr": lr, "weight_decay": wd,\n                "role": "sat_variable_gate",\n            })\n            self.counters = migrate_counters(\n                self.counters,\n                schedule["multimode"]["sat_variable_calibration_bins"])\n            self.resume_migration = None\n            self.allow_v1_upgrade = bool(getattr(\n                args, "detachable_50m_upgrade_multimode", False))\n            configured_receipt = str(getattr(\n                args, "detachable_50m_training_receipt", "") or "")\n            self.training_receipt_path = pathlib.Path(\n                configured_receipt or (pathlib.Path(args.save_dir)\n                                       / "detachable_50m_training_receipt.json"))\n            print("[detachable-50m-multimode-contract] " + json.dumps({\n                "schema": MANIFEST_SCHEMA, "supported_modes": list(MODES),\n                "mode_cycle": schedule["multimode"]["cycle"],\n                "unique_export_parameters": 49_097_218,\n                "causal_hidden_distillation_modes": ["ar"],\n                "live_parent_modified": False,\n            }, sort_keys=True, separators=(",", ":")), flush=True)\n\n        def peek_mapping(self, args):\n            """Cartesian mode/unit clock; no mode is permanently tied to a layer."""\n            attempt = int(self.counters.get("popup_attempts", 0)) + 1\n            update_mode = str(getattr(args, "detachable_50m_update_mode", "sublayer"))\n            units = 44 if update_mode == "sublayer" else 22\n            mm = self.manifest["schedule"]["multimode"]\n            bootstrap = int(mm["bootstrap_commits_per_mode"])\n            post_fix_window = self.counters[\n                POST_FIX_QUALIFICATION_KEY\n            ]["window"]\n            post_fix_pending = [\n                mode for mode in MODES\n                if int(post_fix_window["mode_commits"].get(mode, 0))\n                < int(POST_FIX_REQUIRED_COMMITS[mode])\n            ]\n            lifetime_bootstrapping = any(\n                int(self.counters["mode_commits"].get(mode, 0)) < bootstrap\n                for mode in MODES\n            )\n            cycle_len = (\n                len(MODES)\n                if post_fix_pending\n                else (len(MODES) if lifetime_bootstrapping else len(mm["cycle"]))\n            )\n            unit = ((attempt - 1) // cycle_len) % units\n            return {\n                "attempt": attempt,\n                "popup_mode": self._popup_mode(attempt),\n                "layer": unit // 2 if update_mode == "sublayer" else unit,\n                "sublayer": (("attention" if unit % 2 == 0 else "ffn")\n                             if update_mode == "sublayer" else "layer"),\n            }\n\n        def checkpoint_payload(self):\n            qualification = _refresh_post_fix_qualification(self.counters)\n            payload = super().checkpoint_payload()\n            # Qualification is deliberately post-checkpoint: its receipt binds\n            # the immutable checkpoint file plus exact model/gate state.  A\n            # live checkpoint cannot safely ingest a self-referential sidecar.\n            self.counters["training_receipt_status"] = (\n                "awaiting_external_heldout_receipt")\n            payload[CHECKPOINT_KEY] = {\n                "schema": MULTIMODE_SCHEMA,\n                "supported_modes": list(MODES),\n                "schedule": copy.deepcopy(self.manifest["schedule"]["multimode"]),\n                "resume_migration": copy.deepcopy(\n                    self.counters.get("resume_migration")),\n                "optimizer_groups": [\n                    str(group.get("role") or "student_and_teacher_projection")\n                    for group in self.optimizer.param_groups\n                ],\n                "external_training_receipt": str(self.training_receipt_path),\n            }\n            payload[POST_FIX_QUALIFICATION_KEY] = qualification\n            payload[CAPABILITIES_KEY] = capabilities(\n                None, self.manifest["schedule"]["multimode"])\n            return payload\n\n        def restore(self, checkpoint):\n            loaded_manifest = validate_manifest(checkpoint.get(ns["_DET50_MANIFEST_KEY"]))\n            parent = loaded_manifest["parent_contract"]\n            observed_mode = str(checkpoint.get("alibi_mode") or "")\n            observed_scale = float(checkpoint.get("alibi_scale", float("nan")))\n            if (observed_mode != str(parent["alibi_mode"])\n                    or not math.isfinite(observed_scale)\n                    or abs(observed_scale - float(parent["alibi_scale"])) > 1e-12):\n                raise RuntimeError("detachable-50m export ALiBi contract differs from its bound parent")\n            missing = sorted(key for key in ns["_DET50_STATE_KEYS"] if key not in checkpoint)\n            if missing:\n                raise RuntimeError("detachable-50m manifest without bound state: " + ",".join(missing))\n            if loaded_manifest["optimizer"]["name"] != self.manifest["optimizer"]["name"]:\n                raise RuntimeError("detachable-50m optimizer manifest mismatch")\n            # Validate the manifest/counter/qualification matrix before any\n            # model, optimizer, scaler, or RNG state is mutated.\n            legacy = not bool((loaded_manifest.get("bridge") or {}).get(\n                "export_sat_gate_trainable", False))\n            raw_counters = checkpoint.get(ns["_DET50_COUNTERS_KEY"])\n            if not isinstance(raw_counters, dict):\n                raise RuntimeError("detachable-50m checkpoint counters are invalid")\n            saved_counter_schema = raw_counters.get("schema")\n            if legacy:\n                if saved_counter_schema != "agillm5.detachable-50m.counters.v1":\n                    raise RuntimeError(\n                        "detachable-50m legacy manifest requires counters.v1"\n                    )\n            elif saved_counter_schema not in {PREVIOUS_COUNTERS_SCHEMA,\n                                              COUNTERS_SCHEMA}:\n                raise RuntimeError(\n                    "detachable-50m multimode manifest requires counters.v2/v3"\n                )\n            activation_binding = None\n            if saved_counter_schema == PREVIOUS_COUNTERS_SCHEMA:\n                source_checkpoint_sha256 = str(\n                    os.environ.get(POST_FIX_START_SHA_ENV, "") or ""\n                )\n                if not re.fullmatch(\n                    r"[0-9a-f]{64}", source_checkpoint_sha256\n                ):\n                    raise RuntimeError(\n                        "detachable-50m v2->v3 cutover requires exact "\n                        f"{POST_FIX_START_SHA_ENV}"\n                    )\n                activation_binding = receipt_binding(\n                    source_checkpoint_sha256,\n                    loaded_manifest,\n                    checkpoint[ns["_DET50_MODEL_KEY"]],\n                    checkpoint[ns["_DET50_BRIDGE_KEY"]],\n                    raw_counters,\n                )\n                _validate_checkpoint_binding(\n                    activation_binding, "post_fix_activation"\n                )\n            bins = loaded_manifest["schedule"]["multimode"][\n                "sat_variable_calibration_bins"]\n            validated_counters = migrate_counters(\n                raw_counters, bins, activation_binding=activation_binding\n            )\n            checkpoint_qualification = checkpoint.get(\n                POST_FIX_QUALIFICATION_KEY\n            )\n            if saved_counter_schema == COUNTERS_SCHEMA:\n                if checkpoint_qualification != validated_counters[\n                    POST_FIX_QUALIFICATION_KEY\n                ]:\n                    raise RuntimeError(\n                        "detachable-50m v27 checkpoint qualification/counters mismatch"\n                    )\n            elif checkpoint_qualification is not None:\n                raise RuntimeError(\n                    "detachable-50m pre-v27 checkpoint carries unexpected qualification"\n                )\n            if activation_binding is not None:\n                print("[detachable-50m-post-fix-activation] " + json.dumps({\n                    "schema": POST_FIX_QUALIFICATION_SCHEMA,\n                    "fix_id": NAT_AUTOGRAD_FIX_ID,\n                    "activation_checkpoint_binding": activation_binding,\n                    "activated_lifetime": validated_counters[\n                        POST_FIX_QUALIFICATION_KEY]["activated_lifetime"],\n                    "window": validated_counters[\n                        POST_FIX_QUALIFICATION_KEY]["window"],\n                }, sort_keys=True, separators=(",", ":")), flush=True)\n            self.model.load_state_dict(checkpoint[ns["_DET50_MODEL_KEY"]], strict=True)\n            self.bridge.load_state_dict(checkpoint[ns["_DET50_BRIDGE_KEY"]], strict=True)\n            saved_groups = (checkpoint[ns["_DET50_OPT_KEY"]] or {}).get(\n                "param_groups") or []\n            if legacy:\n                if not self.allow_v1_upgrade:\n                    raise RuntimeError(\n                        "v1 AR-only popup requires explicit "\n                        "--detachable_50m_upgrade_multimode")\n                # v1 has one optimizer group and no gate state.  Load it exactly,\n                # then append a fresh gate-only group without renumbering old state.\n                if len(self.optimizer.param_groups) != 2:\n                    raise RuntimeError("detachable-50m migration expected two fresh optimizer groups")\n                if (len(saved_groups) != 1\n                        or len(saved_groups[0].get("params") or [])\n                        != len(self.optimizer.param_groups[0]["params"])):\n                    raise RuntimeError("detachable-50m v1 optimizer coverage changed")\n                removed = self.optimizer.param_groups.pop()\n                if len(removed.get("params") or []) != 2:\n                    raise RuntimeError("detachable-50m migration gate group is malformed")\n                self.optimizer.load_state_dict(checkpoint[ns["_DET50_OPT_KEY"]])\n                self.optimizer.param_groups[0]["role"] = (\n                    "student_and_teacher_projection")\n                nn.init.zeros_(self.bridge.export_sat_gate.weight)\n                nn.init.zeros_(self.bridge.export_sat_gate.bias)\n                schedule = self.manifest["schedule"]\n                self.optimizer.add_param_group({\n                    "params": list(self.bridge.export_sat_gate.parameters()),\n                    "lr": float(schedule["optimizer_lr"]),\n                    "weight_decay": float(schedule["weight_decay"]),\n                    "role": "sat_variable_gate",\n                })\n            else:\n                if (len(saved_groups) != 2\n                        or str(saved_groups[0].get("role") or "")\n                        != "student_and_teacher_projection"\n                        or str(saved_groups[1].get("role") or "")\n                        != "sat_variable_gate"\n                        or len(saved_groups[0].get("params") or [])\n                        != len(self.optimizer.param_groups[0]["params"])\n                        or len(saved_groups[1].get("params") or []) != 2):\n                    raise RuntimeError(\n                        "detachable-50m v2 optimizer group role/order changed")\n                self.optimizer.load_state_dict(checkpoint[ns["_DET50_OPT_KEY"]])\n                if len(self.optimizer.param_groups) != 2:\n                    raise RuntimeError("detachable-50m multimode optimizer must have two groups")\n            self.scaler.load_state_dict(checkpoint[ns["_DET50_SCALER_KEY"]])\n            rng = checkpoint[ns["_DET50_RNG_KEY"]]\n            if (not isinstance(rng, dict)\n                    or rng.get("schema") != "agillm5.detachable-50m.rng.v1"\n                    or not torch.is_tensor(rng.get("cpu_generator_state"))):\n                raise RuntimeError("detachable-50m RNG state is invalid")\n            self.rng.set_state(rng["cpu_generator_state"].cpu())\n            self.counters = validated_counters\n            if legacy:\n                receipt = self.counters.setdefault("resume_migration", {})\n                receipt.update({\n                    "source_manifest_sha256": loaded_manifest["manifest_sha256"],\n                    "gate_initialization": "deterministic_zero_logits",\n                    "preserved_optimizer_groups": 1,\n                    "added_optimizer_role": "sat_variable_gate",\n                    "added_parameters": 514,\n                })\n            schedule = loaded_manifest["schedule"]\n            minimum = int(schedule["effective_cap_policy"]["minimum_target_cap"])\n            for counter_key, schedule_key in (\n                    ("effective_ordinary_target_cap", "tokens"),\n                    ("effective_anchor_target_cap", "anchor_tokens")):\n                cap = int(self.counters.get(counter_key, schedule[schedule_key]))\n                if not minimum <= cap <= int(schedule[schedule_key]):\n                    raise RuntimeError(f"detachable-50m restored {counter_key} is outside schedule")\n                self.counters[counter_key] = cap\n            self.disabled = bool(self.counters.get("disabled", False)\n                                 or str(self.counters.get("disabled_reason", "") or ""))\n            self.counters["disabled"] = self.disabled\n            # Always write the upgraded signed contract after a successful v1 load.\n            self.manifest = manifest(\n                loaded_manifest["optimizer"]["name"], parent["alibi_mode"],\n                parent["alibi_scale"], schedule)\n            self.resume_migration = copy.deepcopy(self.counters.get("resume_migration"))\n            self.restored = True\n\n        def _select_trainable(self, layer_index, sublayer, full_stack, popup_mode="ar"):\n            self.model.requires_grad_(bool(full_stack))\n            self.bridge.requires_grad_(False)\n            self.bridge.norm.requires_grad_(popup_mode == "ar")\n            self.bridge.proj.requires_grad_(popup_mode == "ar")\n            self.bridge.export_sat_gate.requires_grad_(popup_mode in {"sat_fixed", "sat_variable"})\n            self.bridge.hard_enabled = False\n            if full_stack:\n                return\n            block = self.model.blocks[int(layer_index)]\n            if sublayer == "layer":\n                block.requires_grad_(True)\n            elif sublayer == "attention":\n                block.ln1.requires_grad_(True); block.mha.requires_grad_(True)\n            else:\n                block.ln2.requires_grad_(True); block.ff.requires_grad_(True)\n\n        def _popup_mode(self, attempt):\n            mm = self.manifest["schedule"]["multimode"]\n            post_fix_window = self.counters[\n                POST_FIX_QUALIFICATION_KEY\n            ]["window"]\n            post_fix_pending = [\n                mode for mode in MODES\n                if int(post_fix_window["mode_commits"].get(mode, 0))\n                < int(POST_FIX_REQUIRED_COMMITS[mode])\n            ]\n            if post_fix_pending:\n                # The repaired epoch deliberately re-earns all four mode\n                # qualifications from zero. Selection is commit-aware, so an\n                # overflow or contained error cannot be skipped by the clock.\n                return min(post_fix_pending, key=lambda mode: (\n                    int(post_fix_window["mode_commits"].get(mode, 0)),\n                    int(post_fix_window["mode_attempts"].get(mode, 0)),\n                    MODES.index(mode)))\n            bootstrap = int(mm["bootstrap_commits_per_mode"])\n            pending = [mode for mode in MODES\n                       if int(self.counters["mode_commits"].get(mode, 0)) < bootstrap]\n            if pending:\n                # Commit-aware bootstrap: an overflow/error cannot permanently\n                # leave one mode undertrained while the production mix advances.\n                return min(pending, key=lambda mode: (\n                    int(self.counters["mode_commits"].get(mode, 0)),\n                    int(self.counters["mode_attempts"].get(mode, 0)),\n                    MODES.index(mode)))\n            cycle = mm["cycle"]\n            return str(cycle[(int(attempt) - 1) % len(cycle)])\n\n        def _sat_mask_with_phase(self, tokens, phase):\n            """Prompt-relative SAT pairs; phase 1 leaves position 0 causal."""\n            phase = int(phase)\n            if phase not in (0, 1):\n                raise RuntimeError("detachable-50m SAT phase must be zero or one")\n            index = torch.arange(int(tokens), device=self.device)\n            groups = torch.div(index - phase, 2, rounding_mode="floor")\n            allowed = groups[:, None] >= groups[None, :]\n            return torch.where(\n                allowed,\n                torch.zeros((), device=self.device),\n                torch.full((), float("-inf"), device=self.device),\n            ).unsqueeze(0).unsqueeze(0)\n\n        def _sat_training_layout(self, mode, tokens):\n            if mode not in {"sat_fixed", "sat_variable"}:\n                raise RuntimeError("SAT layout requested for a non-SAT mode")\n            seed_parity = (int(self.counters.get("seed", 0))\n                           ^ (0 if mode == "sat_fixed" else 1)) & 1\n            phase = (int(self.counters["mode_commits"].get(mode, 0))\n                     + seed_parity) % 2\n            available = int(tokens) - 2 - phase\n            paired_rows = (available // 2) * 2\n            if paired_rows < 2:\n                raise RuntimeError("SAT crop has no complete prompt-relative pair")\n            return {\n                "phase": phase,\n                "paired_rows": paired_rows,\n                "source": slice(phase, phase + paired_rows),\n                "target": slice(phase + 2, phase + 2 + paired_rows),\n            }\n\n        def _nat_masks(self, ids, valid):\n            mm = self.manifest["schedule"]["multimode"]\n            eos_id, active_mask_id = (int(x) for x in ns["_nat_boundary_ids"]())\n            if active_mask_id != int(mm["nat_mask_token_id"]):\n                raise RuntimeError("detachable-50m NAT mask contract differs from parent")\n            if bool(ids.eq(active_mask_id).any()):\n                raise RuntimeError("clean detachable-50m NAT IDs contain active mask token")\n            # Prefix+suffix CMLM contract: within every EOS-delimited document,\n            # preserve at least one clean prefix token and mask a parallel suffix.\n            mask = torch.zeros_like(ids, dtype=torch.bool)\n            ratio = float(mm["nat_mask_ratio"])\n            for row in range(ids.size(0)):\n                intervals = ns["_nat_valid_intervals"](\n                    ids[row], valid[row], eos_pad_id=eos_id,\n                    nat_mask_id=active_mask_id)\n                for start, end in intervals:\n                    positions = torch.nonzero(\n                        valid[row, start:end] & ids[row, start:end].ne(eos_id),\n                        as_tuple=False).flatten() + int(start)\n                    if positions.numel() < 2:\n                        continue\n                    count = min(int(positions.numel()) - 1,\n                                max(1, int(round(positions.numel() * ratio))))\n                    mask[row, positions[-count:]] = True\n            if not bool(mask.any()):\n                raise RuntimeError("detachable-50m NAT crop has no prefix+suffix target")\n            return mask\n\n        def _nat_refinement_mask(self, ids, valid, current_mask):\n            """Keep a trailing unresolved suffix in every packed document."""\n            mm = self.manifest["schedule"]["multimode"]\n            eos_id, active_mask_id = (int(x) for x in ns["_nat_boundary_ids"]())\n            next_mask = torch.zeros_like(current_mask)\n            for row in range(ids.size(0)):\n                intervals = ns["_nat_valid_intervals"](\n                    ids[row], valid[row], eos_pad_id=eos_id,\n                    nat_mask_id=active_mask_id)\n                for start, end in intervals:\n                    positions = torch.nonzero(\n                        current_mask[row, start:end],\n                        as_tuple=False).flatten() + int(start)\n                    if positions.numel() == 0:\n                        continue\n                    keep_masked = max(1, int(math.ceil(\n                        positions.numel() * float(\n                            mm["nat_refinement_ratio_decay"]))))\n                    next_mask[row, positions[-keep_masked:]] = True\n            if not bool(next_mask.any()):\n                raise RuntimeError("detachable-50m NAT refinement lost all suffixes")\n            return next_mask\n\n        @torch.no_grad()\n        def _streamed_top1_confidence(self, hidden, chunk=16_384,\n                                      forbidden_id=None):\n            """Exact tied-vocab top-1 and confidence without a full logits matrix."""\n            rows = hidden.detach().float().reshape(-1, hidden.size(-1))\n            table = self.model.emb.weight.detach().float()\n            maximum = torch.full((rows.size(0),), -torch.inf, device=rows.device)\n            normalizer = torch.zeros_like(maximum)\n            best_index = torch.zeros((rows.size(0),), dtype=torch.long,\n                                     device=rows.device)\n            for start in range(0, table.size(0), int(chunk)):\n                logits = rows @ table[start:start + int(chunk)].T\n                if (forbidden_id is not None\n                        and start <= int(forbidden_id) < start + logits.size(1)):\n                    logits[:, int(forbidden_id) - start] = -torch.inf\n                current, local_index = logits.max(dim=-1)\n                updated = torch.maximum(maximum, current)\n                normalizer = (normalizer * torch.exp(maximum - updated)\n                              + torch.exp(logits - updated[:, None]).sum(dim=-1))\n                replace = current > maximum\n                best_index[replace] = local_index[replace] + int(start)\n                maximum = updated\n            confidence = torch.exp(maximum - (maximum + torch.log(normalizer)))\n            return best_index, confidence\n\n        def _sat_gate_loss(self, sat_ctx, sat_tgt, clean_ids, loss_mask):\n            mm = self.manifest["schedule"]["multimode"]\n            first = sat_ctx[:, ::2]\n            second = sat_ctx[:, 1::2]\n            gold1 = sat_tgt[:, ::2]\n            gold2 = sat_tgt[:, 1::2]\n            n = min(first.size(1), second.size(1), gold1.size(1), gold2.size(1))\n            if n <= 0:\n                raise RuntimeError("SAT Variable has no complete two-token blocks")\n            first, second, gold2 = first[:, :n], second[:, :n], gold2[:, :n]\n            eligible = torch.ones((sat_tgt.size(0), n), dtype=torch.bool,\n                                  device=sat_tgt.device)\n            if loss_mask is not None:\n                eligible &= loss_mask[:, ::2][:, :n] & loss_mask[:, 1::2][:, :n]\n            windows = clean_ids.unfold(1, 4, 2)[:, :n]\n            for token_id in ns["_nat_boundary_ids"]():\n                eligible &= ~windows.eq(int(token_id)).any(dim=-1)\n            first = first.reshape(-1, first.size(-1))[eligible.reshape(-1)]\n            second = second.reshape(-1, second.size(-1))[eligible.reshape(-1)]\n            gold2 = gold2.reshape(-1)[eligible.reshape(-1)]\n            cap = max(1, int(self.manifest["schedule"]["loss_tokens"]) // 2)\n            first, second, gold2 = first[:cap], second[:cap], gold2[:cap]\n            if gold2.numel() == 0:\n                raise RuntimeError("SAT Variable has no eligible gate blocks")\n            with torch.no_grad():\n                pred2, _ = self._streamed_top1_confidence(\n                    second.detach(), forbidden_id=int(mm["nat_mask_token_id"]))\n                labels = pred2.eq(gold2).long()\n            gate_logits = self.bridge.export_sat_gate(second.detach()).float()\n            class_weights = _gate_class_weights(\n                self.counters, mm["sat_variable_class_weight_cap"])\n            weight = torch.tensor(class_weights, device=gate_logits.device)\n            weighted_ce = F.cross_entropy(gate_logits, labels, weight=weight)\n            probability_for_loss = gate_logits.softmax(dim=-1)[:, 1]\n            calibration_loss = F.mse_loss(\n                probability_for_loss, labels.to(dtype=torch.float32))\n            loss = (weighted_ce + float(mm["sat_variable_calibration_weight"])\n                    * calibration_loss)\n            with torch.no_grad():\n                probability = gate_logits.softmax(dim=-1)[:, 1]\n                predictions = probability.ge(\n                    mm["sat_variable_stride2_threshold"]).long()\n                bins = int(mm["sat_variable_calibration_bins"])\n                bin_index = torch.clamp((probability * bins).long(), max=bins - 1)\n                calibration = []\n                for index in range(bins):\n                    selected = bin_index.eq(index)\n                    calibration.append({\n                        "count": int(selected.sum().item()),\n                        "probability_sum": float(probability[selected].sum().item()),\n                        "label_sum": int(labels[selected].sum().item()),\n                    })\n                tn = int(((labels == 0) & (predictions == 0)).sum().item())\n                fp = int(((labels == 0) & (predictions == 1)).sum().item())\n                fn = int(((labels == 1) & (predictions == 0)).sum().item())\n                tp = int(((labels == 1) & (predictions == 1)).sum().item())\n            return loss, {\n                "blocks": int(labels.numel()),\n                "stride1_labels": int(labels.eq(0).sum().item()),\n                "stride2_labels": int(labels.eq(1).sum().item()),\n                "predicted_stride1": int(predictions.eq(0).sum().item()),\n                "predicted_stride2": int(predictions.eq(1).sum().item()),\n                "correct": int(predictions.eq(labels).sum().item()),\n                "false_accepts": fp, "false_rejects": fn,\n                "confusion": [[tn, fp], [fn, tp]],\n                "brier_sum": float(((probability - labels.float()) ** 2).sum().item()),\n                "probability_stride2_sum": float(probability.sum().item()),\n                "calibration_bins": calibration,\n                "class_weights": class_weights,\n                "weighted_cross_entropy": float(weighted_ce.detach().item()),\n                "calibration_brier_loss": float(calibration_loss.detach().item()),\n                "threshold": float(mm["sat_variable_stride2_threshold"]),\n                "feature_source": "detached_second_draft_final_fullstack_eval_hidden",\n            }\n\n        def _objective(self, args, mode, ids, teacher_hidden, teacher_loss_mask,\n                       layer_index, sublayer, full_stack):\n            mm = self.manifest["schedule"]["multimode"]\n            valid_full = torch.zeros_like(ids, dtype=torch.bool)\n            if teacher_loss_mask is None:\n                valid_full[:, 1:] = True\n            else:\n                valid_full[:, 1:] = teacher_loss_mask\n            examples = []\n            gate_loss, gate_info = None, None\n            hidden_rows, teacher_rows, target_rows = [], [], []\n            nat_passes = 0\n            sat_phase = None\n            sat_selector = None\n            sat_clean_window = None\n            if mode == "ar":\n                examples.append((ids, ns["causal_mask"](ids.size(1), structured=False),\n                                 slice(None, -1), ids[:, 1:], teacher_hidden[:, :-1],\n                                 valid_full[:, 1:]))\n            elif mode in {"sat_fixed", "sat_variable"}:\n                # Training samples both possible prompt parities.  Phase 1\n                # makes token zero a causal singleton; the singleton and any\n                # incomplete trailing row are excluded from shift-two CE.\n                layout = self._sat_training_layout(mode, ids.size(1))\n                sat_phase = int(layout["phase"])\n                paired_rows = int(layout["paired_rows"])\n                sat_selector = layout["source"]\n                target_selector = layout["target"]\n                mask = self._sat_mask_with_phase(ids.size(1), sat_phase)\n                targets = ids[:, target_selector]\n                sat_clean_window = ids[:, sat_phase:sat_phase + paired_rows + 2]\n                target_valid = valid_full[:, target_selector]\n                windows = sat_clean_window.unfold(1, 4, 2)\n                eos_id, active_mask_id = (int(x) for x in ns["_nat_boundary_ids"]())\n                target_pairs = target_valid.reshape(\n                    target_valid.size(0), -1, 2)\n                clean_context = (~windows[:, :, :2].eq(eos_id).any(dim=-1)\n                                 & ~windows.eq(active_mask_id).any(dim=-1))\n                first_is_eos = windows[:, :, 2].eq(eos_id)\n                complete_pair = (clean_context & target_pairs.all(dim=-1)\n                                 & ~first_is_eos)\n                terminal_first_partial = (clean_context & target_pairs[:, :, 0]\n                                          & first_is_eos)\n                # Normal decisions contribute both rows.  The sole legal\n                # singleton is gold1=EOS, matching serving\'s terminal partial.\n                valid = torch.stack((\n                    complete_pair | terminal_first_partial,\n                    complete_pair,\n                ), dim=-1).reshape_as(target_valid)\n                examples.append((ids, mask, sat_selector, targets,\n                                 teacher_hidden[:, sat_selector], valid))\n            elif mode == "nat":\n                current_mask = self._nat_masks(ids, valid_full)\n                nat_mask_id = int(mm["nat_mask_token_id"])\n                eos_id, _active_mask_id = (\n                    int(value) for value in ns["_nat_boundary_ids"]()\n                )\n                eos_boundary = ids.eq(eos_id)\n                if bool((current_mask & eos_boundary).any()):\n                    raise RuntimeError(\n                        "detachable-50m NAT attempted to mask a clean EOS boundary"\n                    )\n                current_input = ids.masked_fill(current_mask, nat_mask_id)\n                for refinement in range(int(mm["nat_refinement_steps"])):\n                    # EmbeddingBackward saves integer input IDs.  Every pass\n                    # therefore owns immutable storage for the full lifetime of\n                    # its graph; later fill/remask work is copy-on-write.\n                    model_input = current_input.clone()\n                    if not torch.equal(\n                        model_input[eos_boundary], ids[eos_boundary]\n                    ):\n                        raise RuntimeError(\n                            "detachable-50m NAT modified a clean EOS boundary"\n                        )\n                    sequence = (self.model.full_hidden(model_input, None, True)\n                                if full_stack else self.model.local_hidden(\n                                    model_input, None, layer_index, sublayer))\n                    selected_hidden = sequence[current_mask]\n                    if selected_hidden.numel() == 0:\n                        break\n                    hidden_rows.append(selected_hidden.reshape(-1, 256))\n                    teacher_rows.append(teacher_hidden[current_mask].reshape(-1, 1280))\n                    target_rows.append(ids[current_mask].reshape(-1))\n                    nat_passes += 1\n                    if refinement + 1 >= int(mm["nat_refinement_steps"]):\n                        break\n                    predicted, _confidence = self._streamed_top1_confidence(\n                        selected_hidden, forbidden_id=nat_mask_id)\n                    filled_input = current_input.clone()\n                    filled_input[current_mask] = predicted\n                    next_mask = self._nat_refinement_mask(\n                        ids, valid_full, current_mask)\n                    if bool((next_mask & eos_boundary).any()):\n                        raise RuntimeError(\n                            "detachable-50m NAT refinement masked a clean EOS boundary"\n                        )\n                    current_input = filled_input.masked_fill(\n                        next_mask, nat_mask_id\n                    )\n                    current_mask = next_mask\n            else:\n                raise RuntimeError(f"unknown detachable-50m popup mode {mode!r}")\n\n            for model_ids, attention, selector, targets, teacher_rows_mode, valid in examples:\n                sequence = (self.model.full_hidden(model_ids, attention, True)\n                            if full_stack else self.model.local_hidden(\n                                model_ids, attention, layer_index, sublayer))\n                if mode in {"sat_fixed", "sat_variable"} and gate_loss is None:\n                    # The serving gate consumes the final eval-mode full-stack\n                    # SAT hidden. Train it on the second drafted token from that exact\n                    # feature distribution in both SAT modes, detached from core/token CE.\n                    was_training = bool(self.model.training)\n                    try:\n                        self.model.eval()\n                        with torch.no_grad():\n                            gate_sequence = self.model.full_hidden(\n                                model_ids, attention, True)\n                    finally:\n                        self.model.train(was_training)\n                    sat_ctx = gate_sequence[:, sat_selector]\n                    sat_tgt = targets\n                    gate_loss, gate_info = self._sat_gate_loss(\n                        sat_ctx, sat_tgt, sat_clean_window, valid)\n                if mode == "nat":\n                    selected_hidden = sequence[selector]\n                else:\n                    selected_hidden = sequence[:, selector]\n                    if valid is not None:\n                        selected_hidden = selected_hidden[valid]\n                        teacher_rows_mode = teacher_rows_mode[valid]\n                        targets = targets[valid]\n                hidden_rows.append(selected_hidden.reshape(-1, 256))\n                teacher_rows.append(teacher_rows_mode.reshape(-1, 1280))\n                target_rows.append(targets.reshape(-1))\n            student_hidden = torch.cat(hidden_rows, dim=0)\n            teacher_targets = torch.cat(teacher_rows, dim=0)\n            targets = torch.cat(target_rows, dim=0)\n            cap = max(1, int(self.manifest["schedule"]["loss_tokens"]))\n            student_hidden, teacher_targets, targets = (\n                student_hidden[:cap], teacher_targets[:cap], targets[:cap])\n            if targets.numel() == 0:\n                raise RuntimeError("detachable-50m mode has no supervised targets")\n            student_ce = (ns["fused_ce"](student_hidden, self.model.emb.weight, targets)\n                          if full_stack else ns["_Det50FrozenVocabCE"].apply(\n                              student_hidden, self.model.emb.weight.detach(), targets, 16_384))\n            token_weight = float(mm["token_loss_weights"][mode])\n            distill_weight = float(self.manifest["schedule"]["distill_weight"])\n            distill_multiplier = float(mm["distill_multipliers"][mode])\n            if mode == "ar":\n                if distill_multiplier <= 0.0:\n                    raise RuntimeError("detachable-50m AR distillation must stay enabled")\n                projected = self.bridge.proj(self.bridge.norm(student_hidden))\n                student_unit = F.normalize(projected.float(), dim=-1, eps=1e-6)\n                teacher_unit = F.normalize(\n                    teacher_targets.detach().float(), dim=-1, eps=1e-6)\n                normalized_mse = F.mse_loss(student_unit, teacher_unit)\n                cosine_loss = (\n                    1.0 - (student_unit * teacher_unit).sum(dim=-1)).mean()\n                distill_loss = 0.5 * (normalized_mse + cosine_loss)\n            else:\n                # Scalar zero tensors preserve telemetry without creating any\n                # bridge projection graph or gradient for mismatched attention.\n                normalized_mse = student_ce.detach().new_zeros(())\n                cosine_loss = student_ce.detach().new_zeros(())\n                distill_loss = student_ce.detach().new_zeros(())\n            combined = token_weight * student_ce + distill_weight * distill_multiplier * distill_loss\n            if gate_loss is not None:\n                combined = combined + float(mm["sat_variable_gate_weight"]) * gate_loss\n            return {\n                "student_ce": student_ce, "normalized_mse": normalized_mse,\n                "cosine_loss": cosine_loss, "distill_loss": distill_loss,\n                "combined_loss": combined, "targets": targets,\n                "gate_loss": gate_loss, "gate_info": gate_info,\n                "distill_weight": distill_weight,\n                "distill_multiplier": distill_multiplier,\n                "token_weight": token_weight,\n                "nat_refinement_passes": nat_passes,\n                "sat_phase": sat_phase,\n                "student_hidden": student_hidden,\n            }\n\n        def _commit_mode_metrics(self, mode, objective):\n            counters = self.counters\n            counters["mode_commits"][mode] += 1\n            counters["mode_target_tokens"][mode] += int(objective["targets"].numel())\n            sums = counters["mode_loss_sums"][mode]\n            sums["token_ce"] += float(objective["student_ce"].detach().float().item())\n            sums["distill"] += float(objective["distill_loss"].detach().float().item())\n            sums["combined"] += float(objective["combined_loss"].detach().float().item())\n            if mode == "nat":\n                counters["nat_masked_tokens"] += int(objective["targets"].numel())\n                counters["nat_refinement_passes"] += int(objective["nat_refinement_passes"])\n            if mode in {"sat_fixed", "sat_variable"}:\n                phase = int(objective.get("sat_phase", -1))\n                if phase not in (0, 1):\n                    raise RuntimeError("committed SAT objective has no prompt-relative phase")\n                key = "phase_0_even_prompt" if phase == 0 else "phase_1_odd_prompt"\n                counters["sat_prompt_phase_commits"][mode][key] += 1\n            info = objective.get("gate_info")\n            if info:\n                gate = counters["sat_variable_gate"]\n                for key in ("blocks", "stride1_labels", "stride2_labels",\n                            "predicted_stride1", "predicted_stride2", "correct",\n                            "false_accepts", "false_rejects"):\n                    gate[key] = int(gate.get(key, 0)) + int(info[key])\n                gate["brier_sum"] = float(gate.get("brier_sum", 0.0)) + float(info["brier_sum"])\n                gate["probability_stride2_sum"] = float(\n                    gate.get("probability_stride2_sum", 0.0)) + float(\n                        info["probability_stride2_sum"])\n                for aggregate, current in zip(gate["calibration_bins"], info["calibration_bins"]):\n                    aggregate["count"] += int(current["count"])\n                    aggregate["probability_sum"] += float(current["probability_sum"])\n                    aggregate["label_sum"] += int(current["label_sum"])\n                gate["last_class_weights"] = list(info["class_weights"])\n                gate["last_threshold"] = float(info["threshold"])\n\n        def _gate_summary(self):\n            gate = self.counters["sat_variable_gate"]\n            blocks = max(1, int(gate.get("blocks", 0)))\n            ece = 0.0\n            for bucket in gate.get("calibration_bins", []):\n                count = int(bucket.get("count", 0))\n                if count:\n                    ece += count * abs(\n                        float(bucket["probability_sum"]) / count\n                        - float(bucket["label_sum"]) / count)\n            return {\n                "blocks": int(gate.get("blocks", 0)),\n                "accuracy": float(gate.get("correct", 0)) / blocks,\n                "brier": float(gate.get("brier_sum", 0.0)) / blocks,\n                "ece": ece / blocks,\n                "stride2_label_rate": float(gate.get("stride2_labels", 0)) / blocks,\n                "stride2_prediction_rate": float(gate.get("predicted_stride2", 0)) / blocks,\n                "false_accepts": int(gate.get("false_accepts", 0)),\n                "false_rejects": int(gate.get("false_rejects", 0)),\n                "threshold": float(gate.get("last_threshold", 0.999)),\n                "class_weights": list(gate.get("last_class_weights", [1.0, 1.0])),\n            }\n\n        def train_after_commit(self, args, parent_state, parent_step,\n                               mature_loss, teacher_packet):\n            self.counters["parent_commits_seen"] = int(\n                self.counters.get("parent_commits_seen", 0)) + 1\n            parent_dblock_step = int((parent_state or {}).get("step", -1))\n\n            def skip(outcome, reason, counter_key=None, quiet=False):\n                if counter_key:\n                    self.counters[counter_key] = int(self.counters.get(counter_key, 0)) + 1\n                result = {\n                    "schema": "agillm5.detachable-50m.shadow-telemetry.v3",\n                    "intent_id": ns["_DET50_INTENT_ID"], "outcome": str(outcome),\n                    "reason": str(reason), "parent_step": int(parent_step),\n                    "parent_dblock_step": int(parent_dblock_step),\n                    "mature_loss": float(mature_loss),\n                    "teacher_direction": "mature_1p1b_to_detachable_50m",\n                    "teacher_stop_gradient": True, "student_trained": False,\n                    "parent_trained_by_popup": False,\n                    "parent_routing_authority": False,\n                    "mature_batch_retry_requested": False,\n                }\n                self._record(args, result, control_flow=bool(quiet), immediate=not bool(quiet))\n                return result\n\n            if self.disabled:\n                return skip("disabled", self.counters.get("disabled_reason", "persisted_disabled"), quiet=True)\n            if not isinstance(teacher_packet, dict):\n                return skip("teacher_missing", "no_transient_teacher_packet",\n                            "teacher_packet_missing_skips", quiet=True)\n            if teacher_packet.get("schema") != "agillm5.detachable-50m.teacher-packet.v1":\n                return skip("teacher_stale", "teacher_packet_schema", "teacher_packet_stale_skips")\n            if (teacher_packet.get("direction") != "mature_1p1b_to_detachable_50m"\n                    or teacher_packet.get("teacher_stop_gradient") is not True\n                    or int(teacher_packet.get("expected_dblock_commit_step", -2)) != parent_dblock_step):\n                return skip("teacher_stale", "teacher_packet_clock_or_direction",\n                            "teacher_packet_stale_skips")\n            mapping = self.peek_mapping(args)\n            if (int(teacher_packet.get("popup_layer", -1)) != int(mapping["layer"])\n                    or str(teacher_packet.get("popup_sublayer") or "") != str(mapping["sublayer"])):\n                return skip("teacher_stale", "teacher_packet_popup_mapping",\n                            "teacher_packet_stale_skips")\n            chosen_ids = teacher_packet.get("anchor_ids")\n            teacher_hidden = teacher_packet.get("teacher_hidden")\n            teacher_loss_mask = teacher_packet.get("anchor_loss_mask")\n            if (not torch.is_tensor(chosen_ids) or not torch.is_tensor(teacher_hidden)\n                    or chosen_ids.ndim != 2 or teacher_hidden.ndim != 3\n                    or chosen_ids.shape[:2] != teacher_hidden.shape[:2]\n                    or teacher_hidden.size(-1) != 1280 or chosen_ids.size(1) < 4):\n                return skip("teacher_stale", "teacher_packet_tensor_contract",\n                            "teacher_packet_stale_skips")\n            if teacher_hidden.requires_grad or teacher_hidden.grad_fn is not None:\n                return skip("teacher_stale", "teacher_packet_not_stop_gradient",\n                            "teacher_packet_stale_skips")\n            self.counters["teacher_packets_consumed"] += 1\n            self.counters["eligible_teacher_packets"] += 1\n            popup_every = max(1, int(getattr(args, "detachable_50m_every", 1) or 1))\n            if self.counters["eligible_teacher_packets"] % popup_every:\n                return skip("popup_cadence_skip", f"every_{popup_every}",\n                            "popup_cadence_skips", quiet=True)\n\n            # Resolve the prospective work without advancing any attempt clock.\n            # Every validation return below is therefore a pre-attempt skip;\n            # once the clocks advance, exactly one terminal outcome (commit,\n            # overflow, OOM, or error) is guaranteed to be recorded.\n            attempt = int(self.counters["popup_attempts"]) + 1\n            popup_mode = self._popup_mode(attempt)\n            layer_index, sublayer = int(mapping["layer"]), str(mapping["sublayer"])\n            anchor_every = max(0, int(getattr(args, "detachable_50m_anchor_every", 128) or 0))\n            full_stack = (anchor_every > 0\n                          and (self.counters["mode_attempts"][popup_mode] + 1)\n                          % anchor_every == 0)\n            schedule = self.manifest["schedule"]\n            batch_cap = min(int(chosen_ids.size(0)), int(schedule["batch"]))\n            cap_key = "effective_anchor_target_cap" if full_stack else "effective_ordinary_target_cap"\n            configured_cap = int(schedule["anchor_tokens"] if full_stack else schedule["tokens"])\n            effective_target_cap = min(configured_cap, int(self.counters.get(cap_key, configured_cap)))\n            sequence_cap = min(int(chosen_ids.size(1)), effective_target_cap + 1)\n            if batch_cap <= 0 or sequence_cap < 4:\n                return skip("teacher_stale", "teacher_packet_empty_after_cap",\n                            "teacher_packet_stale_skips")\n            if teacher_loss_mask is not None:\n                if (not torch.is_tensor(teacher_loss_mask)\n                        or tuple(teacher_loss_mask.shape) != (chosen_ids.size(0), chosen_ids.size(1) - 1)):\n                    return skip("teacher_stale", "teacher_loss_mask_shape",\n                                "teacher_packet_stale_skips")\n                teacher_loss_mask = teacher_loss_mask[:batch_cap, :sequence_cap - 1]\n            started = time.perf_counter()\n            current_allocation_oom = False\n            objective = None\n            terminal_recorded = False\n            try:\n                self.counters["popup_attempts"] = attempt\n                self.counters["mode_attempts"][popup_mode] += 1\n                self.counters["last_popup_mode"] = popup_mode\n                chosen_ids = chosen_ids[:batch_cap, :sequence_cap].detach().to(\n                    self.device, non_blocking=True)\n                teacher_hidden = teacher_hidden[\n                    :batch_cap, :sequence_cap\n                ].detach().to(self.device, non_blocking=True)\n                if teacher_loss_mask is not None:\n                    teacher_loss_mask = teacher_loss_mask.detach().to(\n                        self.device, non_blocking=True).bool()\n                seed = int(torch.randint(\n                    0, 2**31 - 1, (1,), generator=self.rng\n                ).item())\n                fork_devices = ([\n                    self.device.index if self.device.index is not None\n                    else torch.cuda.current_device()\n                ] if self.device.type == "cuda" else [])\n                self.optimizer.zero_grad(set_to_none=True)\n                with torch.random.fork_rng(devices=fork_devices, enabled=True):\n                    torch.manual_seed(seed)\n                    if self.device.type == "cuda":\n                        torch.cuda.manual_seed(seed)\n                    self.model.train(True)\n                    self._select_trainable(layer_index, sublayer, full_stack, popup_mode)\n                    with ns["amp"](bool(getattr(args, "amp", False))):\n                        objective = self._objective(\n                            args, popup_mode, chosen_ids, teacher_hidden,\n                            teacher_loss_mask, layer_index, sublayer, full_stack)\n                    values = {name: float(objective[name].detach().float().item())\n                              for name in ("student_ce", "normalized_mse", "cosine_loss",\n                                           "distill_loss", "combined_loss")}\n                    gate_loss_value = (None if objective["gate_loss"] is None else\n                                       float(objective["gate_loss"].detach().float().item()))\n                    before = float(self.scaler.get_scale()) if hasattr(self.scaler, "get_scale") else None\n                    self.scaler.scale(objective["combined_loss"]).backward()\n                    self.scaler.unscale_(self.optimizer)\n                    trainable = [p for group in self.optimizer.param_groups\n                                 for p in group["params"] if p.grad is not None]\n                    grad_norm = nn.utils.clip_grad_norm_(trainable, 1.0)\n                    if not torch.isfinite(torch.as_tensor(grad_norm)).item():\n                        raise RuntimeError("detachable-50m non-finite gradients")\n                    self.scaler.step(self.optimizer); self.scaler.update()\n                    after = float(self.scaler.get_scale()) if hasattr(self.scaler, "get_scale") else None\n                    committed = ns["_dblock_scaler_step_committed"](before, after)\n                self.counters["oom_streak"] = self.counters["error_streak"] = 0\n                if committed:\n                    # From this point onward an exception is fail-stop.  It\n                    # must never be reclassified as a second outcome for the\n                    # same attempt (for example if telemetry persistence fails).\n                    terminal_recorded = True\n                    self._commit_mode_metrics(popup_mode, objective)\n                    self.counters["popup_commits"] += 1\n                    if full_stack:\n                        self.counters["popup_fullstack_anchors"] += 1\n                    outcome = "committed"\n                else:\n                    terminal_recorded = True\n                    self.counters["popup_overflow_skips"] += 1\n                    self.counters["mode_overflow_skips"][popup_mode] += 1\n                    outcome = "amp_overflow"\n                post_fix_qualification = _refresh_post_fix_qualification(\n                    self.counters, parent_step=int(parent_step)\n                )\n                parent_receipt = (parent_state or {}).get("training_science_last_receipt") or {}\n                result = {\n                    "schema": "agillm5.detachable-50m.shadow-telemetry.v3",\n                    "intent_id": ns["_DET50_INTENT_ID"], "outcome": outcome,\n                    "popup_mode": popup_mode, "parent_step": int(parent_step),\n                    "parent_dblock_step": int(parent_dblock_step),\n                    "parent_block_observed": parent_receipt.get("block"),\n                    "parent_layers_observed": [int(v) for v in parent_receipt.get("layers", [])],\n                    "mature_loss": float(mature_loss), "student_ce": values["student_ce"],\n                    "student_normalized_hidden_mse": values["normalized_mse"],\n                    "student_cosine_distill_loss": values["cosine_loss"],\n                    "student_distill_loss": values["distill_loss"],\n                    "student_distill_weight": float(objective["distill_weight"]),\n                    "student_mode_distill_multiplier": float(objective["distill_multiplier"]),\n                    "student_token_loss_weight": float(objective["token_weight"]),\n                    "student_combined_loss": values["combined_loss"],\n                    "sat_variable_gate_loss": gate_loss_value,\n                    "sat_variable_gate_batch": copy.deepcopy(objective["gate_info"]),\n                    "sat_variable_gate_aggregate": self._gate_summary(),\n                    "popup_attempt": attempt, "popup_commit": self.counters["popup_commits"],\n                    "popup_layer": layer_index, "popup_sublayer": sublayer,\n                    "popup_fullstack_anchor": bool(full_stack),\n                    "popup_target_tokens": int(objective["targets"].numel()),\n                    "nat_refinement_passes": int(objective["nat_refinement_passes"]),\n                    "popup_batch_cap": batch_cap,\n                    "popup_effective_target_cap": effective_target_cap,\n                    "popup_sequence_cap": sequence_cap,\n                    "teacher_direction": "mature_1p1b_to_detachable_50m",\n                    "teacher_stop_gradient": True, "rng_seed": seed,\n                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),\n                    "parent_trained_by_popup": False,\n                    "parent_routing_authority": False,\n                    "hard_bridge_injection_enabled": False,\n                    "post_fix_qualification": post_fix_qualification,\n                }\n                self.counters.update(\n                    last_parent_step=int(parent_step), last_popup_mode=popup_mode,\n                    last_student_ce=values["student_ce"],\n                    last_distill_loss=values["distill_loss"],\n                    last_combined_loss=values["combined_loss"],\n                    last_mature_loss=float(mature_loss))\n                self._record(args, result)\n                return result\n            except Exception as exc:\n                if terminal_recorded:\n                    raise\n                text = str(exc).lower()\n                is_oom = isinstance(exc, (RuntimeError, MemoryError)) and any(\n                    marker in text for marker in (\n                        "out of memory", "cuda_error_out_of_memory",\n                        "cublas_status_alloc_failed", "allocation failed",\n                        "failed to allocate", "cannot allocate memory"))\n                current_allocation_oom = bool(is_oom)\n                key = "popup_oom_skips" if is_oom else "popup_error_skips"\n                self.counters[key] += 1\n                self.counters["mode_oom_skips" if is_oom else "mode_error_skips"][popup_mode] += 1\n                streak, other = (("oom_streak", "error_streak") if is_oom\n                                 else ("error_streak", "oom_streak"))\n                self.counters[streak] = int(self.counters.get(streak, 0)) + 1\n                self.counters[other] = 0\n                if is_oom:\n                    policy = schedule["effective_cap_policy"]\n                    minimum = int(policy["minimum_target_cap"])\n                    old_cap = int(self.counters.get(cap_key, effective_target_cap))\n                    self.counters[cap_key] = max(\n                        minimum, int(math.floor(old_cap * float(policy["oom_backoff_factor"]))))\n                    disable = old_cap <= minimum and self.counters[streak] >= 3\n                else:\n                    disable = self.counters[streak] >= 3\n                if disable:\n                    self.disabled = self.counters["disabled"] = True\n                    self.counters["disabled_reason"] = f"consecutive_{streak}"\n                post_fix_qualification = _refresh_post_fix_qualification(\n                    self.counters, parent_step=int(parent_step)\n                )\n                result = {\n                    "schema": "agillm5.detachable-50m.shadow-telemetry.v3",\n                    "outcome": "oom_skipped" if is_oom else "error_skipped",\n                    "popup_mode": popup_mode, "parent_step": int(parent_step),\n                    "parent_dblock_step": parent_dblock_step,\n                    "mature_loss": float(mature_loss), "popup_attempt": attempt,\n                    "error_type": type(exc).__name__, "error": str(exc)[:500],\n                    "oom_streak": self.counters.get("oom_streak", 0),\n                    "error_streak": self.counters.get("error_streak", 0),\n                    "next_effective_target_cap": self.counters.get(cap_key, effective_target_cap),\n                    "teacher_direction": "mature_1p1b_to_detachable_50m",\n                    "teacher_stop_gradient": True, "mature_commit_retained": True,\n                    "mature_batch_retry_requested": False,\n                    "parent_trained_by_popup": False,\n                    "parent_routing_authority": False,\n                    "post_fix_qualification": post_fix_qualification,\n                }\n                self._record(args, result)\n                return result\n            finally:\n                self.optimizer.zero_grad(set_to_none=True)\n                self.model.requires_grad_(False)\n                self.bridge.requires_grad_(False)\n                self.bridge.hard_enabled = False\n                if self.device.type == "cuda" and current_allocation_oom:\n                    try:\n                        torch.cuda.empty_cache()\n                    except Exception:\n                        pass\n\n    def trained_export_gate(bridge_state):\n        if not isinstance(bridge_state, dict):\n            raise RuntimeError("detachable-50m export requires bridge state")\n        required = {"export_sat_gate.weight", "export_sat_gate.bias"}\n        if not required.issubset(bridge_state):\n            raise RuntimeError("detachable-50m export bridge has no SAT-variable gate")\n        gate = nn.Linear(256, 2, bias=True)\n        gate.load_state_dict({\n            "weight": bridge_state["export_sat_gate.weight"],\n            "bias": bridge_state["export_sat_gate.bias"],\n        }, strict=True)\n        return gate\n\n    def export_checkpoint(source, destination, codec="zstd3",\n                          training_receipt_path=""):\n        source = ns["_resolve_ckpt"](pathlib.Path(source)) or pathlib.Path(source)\n        skip = {"core", "ar", "sat", "nat", "opt", "scaler", "weights",\n                ns["_DET50_OPT_KEY"], ns["_DET50_SCALER_KEY"],\n                ns["_DET50_RNG_KEY"]}\n        checkpoint = ns["_try_load"](source, map_location="cpu", skip_keys=skip)\n        if not isinstance(checkpoint, dict):\n            raise RuntimeError(f"cannot load detachable-50m suite {source}")\n        try:\n            source_manifest = validate_manifest(checkpoint.get(ns["_DET50_MANIFEST_KEY"]))\n            sat_gate_contract = source_manifest.get(\n                "agillm5_detachable_50m_sat_gate_v27_13")\n            if (not isinstance(sat_gate_contract, dict)\n                    or sat_gate_contract.get("schema")\n                    != "agillm5.detachable-50m.sat-gate-v27.13.v1"\n                    or sat_gate_contract.get("fix_id")\n                    != "v27.13-second-hidden-precision-failclosed-20260903"\n                    or sat_gate_contract.get("feature_source")\n                    != "detached_second_draft_final_fullstack_eval_hidden"\n                    or sat_gate_contract.get("label_contract")\n                    != "second_draft_exact_tied_vocab_top1_equals_gold2"\n                    or not math.isclose(float(sat_gate_contract.get(\n                        "stride2_threshold", float("nan"))),\n                        0.999, rel_tol=0.0, abs_tol=1e-12)):\n                raise RuntimeError(\n                    "detachable-50m v3 export requires the exact v27.13 precision-failclosed SAT gate contract")\n            if not bool((source_manifest.get("bridge") or {}).get(\n                    "export_sat_gate_trainable", False)):\n                # Legacy AR-only exports keep their byte-for-byte v1 contract.\n                ns["_agillm43_release_loaded_checkpoint"](checkpoint)\n                checkpoint = None\n                return base_export_checkpoint(source, destination, codec)\n            raw_counters = checkpoint.get(ns["_DET50_COUNTERS_KEY"])\n            source_counter_schema = (\n                raw_counters.get("schema") if isinstance(raw_counters, dict)\n                else None\n            )\n            counters = migrate_counters(\n                raw_counters,\n                source_manifest["schedule"]["multimode"][\n                    "sat_variable_calibration_bins"])\n            if (source_counter_schema == COUNTERS_SCHEMA\n                    and checkpoint.get(POST_FIX_QUALIFICATION_KEY)\n                    != counters[POST_FIX_QUALIFICATION_KEY]):\n                raise RuntimeError(\n                    "detachable-50m export qualification/counters mismatch"\n                )\n            state = checkpoint.get(ns["_DET50_MODEL_KEY"])\n            if not isinstance(state, dict):\n                raise RuntimeError("detachable-50m manifest has no popup weights")\n            bridge_state = checkpoint.get(ns["_DET50_BRIDGE_KEY"])\n            binding = receipt_binding(\n                ns["_sha256_file"](source), source_manifest, state,\n                bridge_state, counters)\n            requested_receipt = str(training_receipt_path or "").strip()\n            candidate_receipt_path = (\n                pathlib.Path(requested_receipt) if requested_receipt\n                else source.parent / "detachable_50m_training_receipt.json"\n            )\n            receipt_path = None\n            signed_receipt_envelope = None\n            training_receipt = None\n            if candidate_receipt_path.is_file():\n                receipt_path = candidate_receipt_path\n                with receipt_path.open("r", encoding="utf-8") as handle:\n                    signed_receipt_envelope = _strict_json_load(handle)\n                authenticated_receipt = validate_signed_training_receipt_envelope(\n                    signed_receipt_envelope\n                )\n                training_receipt = validate_training_receipt(\n                    authenticated_receipt, counters,\n                    source_manifest["schedule"]["multimode"], binding)\n                if (_canonical_signed_receipt_bytes(training_receipt)\n                        != _canonical_signed_receipt_bytes(\n                            signed_receipt_envelope["receipt"]\n                        )):\n                    raise RuntimeError(\n                        "detachable-50m authenticated and legacy receipt copies differ"\n                    )\n            capability_contract = capabilities(\n                training_receipt, source_manifest["schedule"]["multimode"])\n            operator_override_unverified = training_receipt is None\n            if operator_override_unverified:\n                capability_contract["operator_override_unverified"] = True\n                capability_contract["release_policy"] = (\n                    "operator_requested_popout_without_heldout_receipt"\n                )\n                for mode in MODES:\n                    capability_contract["modes"][mode].update({\n                        "status": "operator_override_runnable_unverified",\n                        "operator_override_runnable": True,\n                    })\n            with torch.random.fork_rng(devices=[], enabled=True):\n                torch.manual_seed(0); model = ns["Detachable50MModel"]()\n            model.load_state_dict(state, strict=True)\n            core_count = ns["_det50_unique_params"](model)\n            if core_count != 49_096_704:\n                raise RuntimeError(f"detachable-50m export count mismatch: {core_count}")\n            export_gate = trained_export_gate(bridge_state)\n            export_count = core_count + sum(p.numel() for p in export_gate.parameters())\n            if export_count != 49_097_218:\n                raise RuntimeError(f"detachable-50m export total mismatch: {export_count}")\n            tokenizer_payload = {key: copy.deepcopy(checkpoint.get(key)) for key in (\n                "tokenizer_payload_schema", "tokenizer_id", "tokenizer_json",\n                "tokenizer_bundle", "tokenizer_special", "transformers_version",\n                "tokenizers_version") if checkpoint.get(key) is not None}\n            contract = source_manifest.get("tokenizer_contract") or {}\n            tokenizer_json = tokenizer_payload.get("tokenizer_json")\n            if (str(tokenizer_payload.get("tokenizer_id") or "") != str(contract.get("tokenizer_id") or "")\n                    or int((tokenizer_payload.get("tokenizer_special") or {}).get("vocab_size", -1))\n                    != int(contract.get("vocab_size", -2))\n                    or not isinstance(tokenizer_json, str)\n                    or hashlib.sha256(tokenizer_json.encode()).hexdigest()\n                    != str(contract.get("tokenizer_json_sha256"))):\n                raise RuntimeError("detachable-50m export tokenizer contract mismatch")\n            parent = source_manifest["parent_contract"]\n            alibi_mode, alibi_scale = str(parent["alibi_mode"]), float(parent["alibi_scale"])\n            if (str(checkpoint.get("alibi_mode") or "") != alibi_mode\n                    or float(checkpoint.get("alibi_scale")) != alibi_scale):\n                raise RuntimeError("detachable-50m export parent ALiBi contract mismatch")\n            multimode = source_manifest["schedule"]["multimode"]\n            payload = {\n                "core": model.state_dict(),\n                "ar": {"proj.weight": model.emb.weight.detach()},\n                "sat": {"proj.weight": model.emb.weight.detach(),\n                        "gate.weight": export_gate.weight.detach(),\n                        "gate.bias": export_gate.bias.detach()},\n                "nat": {"proj.weight": model.emb.weight.detach()},\n                "cfg": {"d": 256, "layers": 22, "heads": 4, "rank": 64,\n                        "tie_kv": True, "moe_ffn": False, "nat_head": True},\n                "tie_weights": True, "alibi_mode": alibi_mode,\n                "alibi_scale": alibi_scale, **tokenizer_payload,\n                # Serving-critical multimode values are duplicated at top level\n                # so a loader cannot silently fall back to an AR-era default.\n                "nat_mask_token_id": int(multimode["nat_mask_token_id"]),\n                "sat_variable_stride2_threshold": float(\n                    multimode["sat_variable_stride2_threshold"]),\n                "nat_refinement_steps": int(multimode["nat_refinement_steps"]),\n                "nat_refinement_ratio_decay": float(\n                    multimode["nat_refinement_ratio_decay"]),\n                "agillm5_detachable_50m_export": {\n                    "schema": "agillm5.detachable-50m.multimode-export.v3",\n                    "intent_id": ns["_DET50_INTENT_ID"],\n                    "source_manifest_sha256": source_manifest["manifest_sha256"],\n                    "core_ar_unique_parameters": core_count,\n                    "unique_parameters": export_count,\n                    "maximum_parameters": 50_000_000,\n                    "tied_biasless_vocabulary": True, "standalone": True,\n                    "supported_modes": list(MODES),\n                    "sat_fixed_block": 2,\n                    "sat_variable_block": 2,\n                    "sat_prompt_relative_pairing": True,\n                    "sat_variable_stride2_threshold": multimode[\n                        "sat_variable_stride2_threshold"],\n                    "sat_variable_routing_release_state": "training-only-fail-closed",\n                    "sat_variable_stride2_enabled": False,\n                    "sat_variable_gate_feature_contract": {\n                        "schema": "agillm5.detachable-50m.sat-gate-feature.v1",\n                        "feature_source": "detached_second_draft_final_fullstack_eval_hidden",\n                        "hidden_buffer_index": 1,\n                        "label_contract": "second_draft_exact_tied_vocab_top1_equals_gold2",\n                        "gate_train_modes": ["sat_fixed", "sat_variable"],\n                    },\n                    "nat_mask_token_id": multimode["nat_mask_token_id"],\n                    "nat_refinement_steps": multimode["nat_refinement_steps"],\n                    "nat_refinement_ratio_decay": multimode[\n                        "nat_refinement_ratio_decay"],\n                    "mode_mixture": copy.deepcopy(multimode["mixture"]),\n                    "trained_sat_variable_gate": bool(training_receipt),\n                    "training_receipt_present": bool(training_receipt),\n                    "training_receipt_signed": bool(training_receipt),\n                    "training_receipt_authority": (\n                        SIGNED_TRAINING_RECEIPT_KEY if training_receipt is not None\n                        else None\n                    ),\n                    "training_receipt_legacy_copy_authoritative": False,\n                    "training_receipt_signature_key_id": (\n                        SIGNATURE_KEY_ID if training_receipt is not None else None\n                    ),\n                    "training_receipt_public_key_der_sha256": (\n                        SIGNATURE_PUBLIC_DER_SHA256\n                        if training_receipt is not None else None\n                    ),\n                    "operator_override_unverified": operator_override_unverified,\n                    "release_gate_policy": (\n                        "signed_heldout_receipt" if training_receipt is not None\n                        else "operator_requested_popout_without_heldout_receipt"\n                    ),\n                    "export_state_sha256": binding["export_state_sha256"],\n                    # Bind the release metadata to the exact source file,\n                    # manifest, model, gate, and training clocks.  The receipt\n                    # carries the identical object and validation compares it\n                    # byte-for-byte before this payload can be written.\n                    "checkpoint_binding": copy.deepcopy(binding),\n                },\n                CAPABILITIES_KEY: capability_contract,\n            }\n            if training_receipt is not None:\n                # Compatibility-only inner copy.  It has already been compared\n                # canonically with the authenticated envelope receipt above and\n                # is never an activation authority by itself.\n                payload[TRAINING_RECEIPT_KEY] = training_receipt\n                payload[SIGNED_TRAINING_RECEIPT_KEY] = copy.deepcopy(\n                    signed_receipt_envelope\n                )\n            if CHECKPOINT_KEY in checkpoint:\n                payload[CHECKPOINT_KEY] = copy.deepcopy(checkpoint[CHECKPOINT_KEY])\n            payload[POST_FIX_QUALIFICATION_KEY] = copy.deepcopy(\n                counters[POST_FIX_QUALIFICATION_KEY]\n            )\n            for key in ("nat_mask_contract", "nat_mask_schema_version",\n                        "nat_mask_legacy_blank_id", "nat_mask_eos_id", "nat_mask_contract_source",\n                        "nat_mask_migrated_from_id"):\n                if key in checkpoint:\n                    payload[key] = copy.deepcopy(checkpoint[key])\n            destination = pathlib.Path(destination)\n            destination.parent.mkdir(parents=True, exist_ok=True)\n            if destination.exists():\n                raise FileExistsError(f"refusing to overwrite {destination}")\n            temporary = destination.with_suffix(destination.suffix + ".tmp")\n            info = ns["_agillm43_save_pt"](payload, temporary, codec=codec, zstd_level=3)\n            ns["_agillm43_finalize_pt_save"](temporary, destination, info)\n            result = {"schema": "agillm5.detachable-50m.multimode-export.v3",\n                      "path": str(destination), "source": str(source),\n                      "unique_parameters": export_count,\n                      "core_ar_unique_parameters": core_count,\n                      "supported_modes": list(MODES),\n                      "trained_modes": [mode for mode in MODES if\n                                        capability_contract["modes"][mode]["trained"]],\n                      "runnable_modes": list(MODES),\n                      "operator_override_unverified": operator_override_unverified,\n                      "training_receipt": (str(receipt_path)\n                                           if training_receipt is not None else None),\n                      "codec": info.get("codec", "raw")}\n            print("[detachable-50m-export] " + json.dumps(\n                result, sort_keys=True, separators=(",", ":")), flush=True)\n            return result\n        finally:\n            if checkpoint is not None:\n                ns["_agillm43_release_loaded_checkpoint"](checkpoint)\n\n    ns["_det50_schedule_from_args_ar_v1"] = base_schedule_from_args\n    ns["_det50_validate_schedule_ar_v1"] = base_validate_schedule\n    ns["_det50_manifest_ar_v1"] = base_manifest\n    ns["_det50_validate_manifest_ar_v1"] = base_validate_manifest\n    ns["_det50_schedule_from_args"] = schedule_from_args\n    ns["_det50_validate_schedule"] = validate_schedule\n    ns["_det50_apply_schedule_to_args"] = apply_schedule\n    ns["_det50_manifest"] = manifest\n    ns["_det50_validate_manifest"] = validate_manifest\n    ns["_det50_migrate_counters_v2"] = migrate_counters\n    ns["_det50_migrate_counters_v3"] = migrate_counters\n    ns["_det50_refresh_post_fix_qualification"] = (\n        _refresh_post_fix_qualification\n    )\n    ns["_det50_trained_export_gate"] = trained_export_gate\n    ns["_DET50_MULTIMODE_KEY"] = CHECKPOINT_KEY\n    ns["_DET50_CAPABILITIES_KEY"] = CAPABILITIES_KEY\n    ns["_DET50_TRAINING_RECEIPT_KEY"] = TRAINING_RECEIPT_KEY\n    ns["_DET50_SIGNED_TRAINING_RECEIPT_KEY"] = (\n        SIGNED_TRAINING_RECEIPT_KEY\n    )\n    ns["_DET50_SIGNED_RECEIPT_SCHEMA"] = SIGNED_RECEIPT_SCHEMA\n    ns["_DET50_RECEIPT_SIGNATURE_SCHEMA"] = SIGNATURE_SCHEMA\n    ns["_DET50_RECEIPT_SIGNATURE_KEY_ID"] = SIGNATURE_KEY_ID\n    ns["_DET50_RECEIPT_PUBLIC_KEY_DER_SHA256"] = (\n        SIGNATURE_PUBLIC_DER_SHA256\n    )\n    ns["_det50_validate_signed_training_receipt_envelope"] = (\n        validate_signed_training_receipt_envelope\n    )\n    ns["_det50_strict_json_load"] = _strict_json_load\n    ns["_det50_validate_training_receipt"] = validate_training_receipt\n    ns["_det50_receipt_binding"] = receipt_binding\n    ns["_det50_state_dict_sha256"] = _state_dict_sha256\n    ns["_det50_export_state_sha256"] = _export_state_sha256\n    ns["_det50_capabilities"] = capabilities\n    ns["_DET50_MULTIMODE_SCHEMA"] = MULTIMODE_SCHEMA\n    ns["_DET50_COUNTERS_SCHEMA"] = COUNTERS_SCHEMA\n    ns["_DET50_POST_FIX_QUALIFICATION_KEY"] = POST_FIX_QUALIFICATION_KEY\n    ns["Detachable50MRuntime"] = MultimodeRuntime\n    ns["export_detachable_50m_checkpoint"] = export_checkpoint\n    ns["_DET50_MULTIMODE_V26_INSTALLED"] = True\n'
+_agillm_sf_module = _agillm_sf_types.ModuleType('det50_multimode_v26_overlay')
+_agillm_sf_module.__file__ = __file__ + '#det50_multimode_v26_overlay.py'
+_agillm_sf_module.__package__ = ''
+_agillm_sf_module.__dict__.update(_AGILLM_SF_SEED_BYTES=_AGILLM_SF_SEED_BYTES, _AGILLM_SF_IO=_agillm_sf_io)
+_agillm_sf_linecache.cache[_agillm_sf_module.__file__] = (len(_AGILLM_SF_SOURCE), None, _AGILLM_SF_SOURCE.splitlines(True), _agillm_sf_module.__file__)
+_agillm_sf_sys.modules['det50_multimode_v26_overlay'] = _agillm_sf_module
+exec(compile(_AGILLM_SF_SOURCE, _agillm_sf_module.__file__, 'exec'), _agillm_sf_module.__dict__)
+_agillm_sf_module.install(globals())
+
+# Folded module: det50_posthoc_matryoshka_v27_6_overlay
+_AGILLM_SF_SOURCE = '"""Post-hoc Matryoshka-style output distillation for the detachable 50M popup.\n\nThe mature parent is a frozen, token-aged teacher.  The detachable 49.1M popup\nremains a standalone student rather than pretending to be a strict parameter\nsubset.  Causal AR updates use the paper\'s convex ground-truth/output-KD loss;\nSAT and NAT keep their native objectives because a causal teacher distribution\nis not a valid target for their different attention contracts.\n"""\n\nfrom __future__ import annotations\n\nimport copy\nimport math\n\n\nEXTENSION_KEY = "agillm5_detachable_50m_posthoc_matryoshka"\nEXTENSION_SCHEMA = "agillm5.detachable-50m.posthoc-matryoshka.v1"\nLOGIT_SCHEDULE_SCHEMA = "agillm5.detachable-50m.logit-distillation.v1"\nTEACHER_PACKET_SCHEMA = "agillm5.detachable-50m.teacher-packet.v2"\nCOUNTERS_SCHEMA = "agillm5.detachable-50m.posthoc-matryoshka-counters.v1"\nFIX_ID = "v27.6-posthoc-matryoshka-logit-kd-20260902"\nPAPER = "arXiv:2608.09703"\n\n\ndef _logit_kd_terms(torch, F, student_logits, teacher_logits, targets,\n                    alpha: float, temperature: float):\n    """Return the exact full-vocabulary convex CE/KD terms.\n\n    The teacher tensor is always detached.  ``distill_loss`` includes the\n    standard T^2 gradient correction used by the training runtime.\n    """\n    if student_logits.ndim != 2 or teacher_logits.ndim != 2:\n        raise RuntimeError("post-hoc Matryoshka logits must be rank two")\n    if student_logits.shape != teacher_logits.shape:\n        raise RuntimeError("student/teacher vocabulary logits have different shapes")\n    if targets.ndim != 1 or targets.numel() != student_logits.size(0):\n        raise RuntimeError("post-hoc Matryoshka target/logit rows differ")\n    alpha = float(alpha)\n    temperature = float(temperature)\n    if not 0.0 < alpha < 1.0:\n        raise RuntimeError("post-hoc Matryoshka alpha must be in (0,1)")\n    if not math.isfinite(temperature) or not 0.05 <= temperature <= 10.0:\n        raise RuntimeError("post-hoc Matryoshka temperature is outside [0.05,10]")\n\n    student_logits = student_logits.float()\n    teacher_logits = teacher_logits.detach().float()\n    student_ce = F.cross_entropy(student_logits, targets)\n    with torch.no_grad():\n        teacher_prob = F.softmax(teacher_logits / temperature, dim=-1)\n        teacher_log_prob = F.log_softmax(teacher_logits / temperature, dim=-1)\n        teacher_entropy = -(teacher_prob * teacher_log_prob).sum(-1).mean()\n        teacher_top1 = teacher_logits.argmax(dim=-1)\n    student_log_prob = F.log_softmax(student_logits / temperature, dim=-1)\n    distill_ce_unscaled = -(teacher_prob * student_log_prob).sum(-1).mean()\n    distill_loss = distill_ce_unscaled * (temperature * temperature)\n    convex_loss = (1.0 - alpha) * student_ce + alpha * distill_loss\n    with torch.no_grad():\n        teacher_student_kl = (distill_ce_unscaled.detach()\n                              - teacher_entropy.detach()).clamp_min(0.0)\n        top1_agreement = student_logits.detach().argmax(dim=-1).eq(\n            teacher_top1).float().mean()\n    return {\n        "student_ce": student_ce,\n        "distill_loss": distill_loss,\n        "distill_ce_unscaled": distill_ce_unscaled,\n        "convex_loss": convex_loss,\n        "teacher_entropy": teacher_entropy,\n        "teacher_student_kl": teacher_student_kl,\n        "top1_agreement": top1_agreement,\n    }\n\n\ndef install(ns):\n    if ns.get("_DET50_POSTHOC_MATRYOSHKA_V27_6_INSTALLED"):\n        return\n\n    torch = ns["torch"]\n    nn = ns["nn"]\n    F = ns["F"]\n    BaseRuntime = ns["Detachable50MRuntime"]\n    base_schedule_from_args = ns["_det50_schedule_from_args"]\n    base_validate_schedule = ns["_det50_validate_schedule"]\n    base_apply_schedule = ns["_det50_apply_schedule_to_args"]\n    base_manifest = ns["_det50_manifest"]\n    base_validate_manifest = ns["_det50_validate_manifest"]\n\n    def default_logit_schedule():\n        return {\n            "schema": LOGIT_SCHEDULE_SCHEMA,\n            "enabled": True,\n            "alpha": 0.30,\n            "temperature": 1.0,\n            "max_tokens": 64,\n            "hidden_aux_weight": 0.0,\n            "teacher_packet_schema": TEACHER_PACKET_SCHEMA,\n            "teacher_source": "mature_parent_precommit_causal_ar_logits",\n            "teacher_stop_gradient": True,\n            "exact_full_vocabulary": True,\n            "distilled_modes": ["ar", "sat_fixed", "sat_variable", "nat"],\n        }\n\n    def validate_logit_schedule(value):\n        expected_keys = {\n            "schema", "enabled", "alpha", "temperature", "max_tokens",\n            "hidden_aux_weight", "teacher_packet_schema", "teacher_source",\n            "teacher_stop_gradient", "exact_full_vocabulary", "distilled_modes",\n        }\n        if not isinstance(value, dict) or set(value) != expected_keys:\n            raise RuntimeError("detachable-50m logit-distillation schedule changed")\n        value = copy.deepcopy(value)\n        if value.get("schema") != LOGIT_SCHEDULE_SCHEMA:\n            raise RuntimeError("detachable-50m logit-distillation schema is invalid")\n        if value.get("enabled") is not True:\n            raise RuntimeError("detachable-50m AR logit distillation must stay enabled")\n        alpha = float(value.get("alpha", float("nan")))\n        temperature = float(value.get("temperature", float("nan")))\n        hidden_aux = float(value.get("hidden_aux_weight", float("nan")))\n        if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:\n            raise RuntimeError("detachable-50m logit-distillation alpha must be in (0,1)")\n        if not math.isfinite(temperature) or not 0.05 <= temperature <= 10.0:\n            raise RuntimeError("detachable-50m logit temperature is outside [0.05,10]")\n        if not math.isfinite(hidden_aux) or not 0.0 <= hidden_aux <= 10.0:\n            raise RuntimeError("detachable-50m hidden auxiliary weight is invalid")\n        raw_tokens = value.get("max_tokens")\n        if isinstance(raw_tokens, bool):\n            raise RuntimeError("detachable-50m logit token cap must be an integer")\n        max_tokens = int(raw_tokens)\n        if not 1 <= max_tokens <= 64:\n            raise RuntimeError("detachable-50m logit token cap is outside [1,64]")\n        if (value.get("teacher_packet_schema") != TEACHER_PACKET_SCHEMA\n                or value.get("teacher_source")\n                != "mature_parent_precommit_causal_ar_logits"\n                or value.get("teacher_stop_gradient") is not True\n                or value.get("exact_full_vocabulary") is not True\n                or not set(value.get("distilled_modes", [])).issubset({"ar", "sat_fixed", "sat_variable", "nat"})):\n            raise RuntimeError("detachable-50m teacher/output contract changed")\n        value.update(alpha=alpha, temperature=temperature,\n                     max_tokens=max_tokens, hidden_aux_weight=hidden_aux)\n        return value\n\n    def validate_schedule(schedule):\n        schedule = base_validate_schedule(schedule)\n        schedule["logit_distillation"] = validate_logit_schedule(\n            schedule.get("logit_distillation") or default_logit_schedule())\n        return schedule\n\n    def schedule_from_args(args):\n        schedule = base_schedule_from_args(args)\n        kd = default_logit_schedule()\n        kd["alpha"] = float(getattr(\n            args, "detachable_50m_logit_distill_alpha", 0.30))\n        kd["temperature"] = float(getattr(\n            args, "detachable_50m_logit_distill_temperature", 1.0))\n        kd["max_tokens"] = int(getattr(\n            args, "detachable_50m_logit_distill_tokens", 64))\n        kd["hidden_aux_weight"] = float(getattr(\n            args, "detachable_50m_hidden_distill_weight", 0.0))\n        schedule["logit_distillation"] = kd\n        return validate_schedule(schedule)\n\n    def apply_schedule(args, schedule):\n        schedule = validate_schedule(schedule)\n        base_apply_schedule(args, schedule)\n        kd = schedule["logit_distillation"]\n        setattr(args, "detachable_50m_logit_distill_alpha", kd["alpha"])\n        setattr(args, "detachable_50m_logit_distill_temperature",\n                kd["temperature"])\n        setattr(args, "detachable_50m_logit_distill_tokens", kd["max_tokens"])\n        setattr(args, "detachable_50m_hidden_distill_weight",\n                kd["hidden_aux_weight"])\n        return schedule\n\n    def extension_contract(schedule):\n        kd = validate_schedule(schedule)["logit_distillation"]\n        value = {\n            "schema": EXTENSION_SCHEMA,\n            "fix_id": FIX_ID,\n            "paper_reference": PAPER,\n            "method": "posthoc_asymmetric_matryoshka_output_distillation",\n            "mature_teacher": {\n                "role": "frozen_token_aged_1p1b_parent",\n                "token_age_source": "bound_parent_checkpoint_and_creation_receipt",\n                "logits": "exact_pre_parent_commit_causal_ar_full_vocabulary",\n                "stop_gradient": True,\n            },\n            "detachable_student": {\n                "role": "new_49p1m_standalone_student",\n                "initialization": "checkpoint_creation_receipt_authoritative",\n                "trained_modes": ["ar", "sat_fixed", "sat_variable", "nat"],\n            },\n            "objective": {\n                "ar": "(1-alpha)*ground_truth_ce+alpha*T^2*teacher_cross_entropy",\n                "alpha": kd["alpha"],\n                "temperature": kd["temperature"],\n                "max_teacher_targets": kd["max_tokens"],\n                "hidden_aux_weight": kd["hidden_aux_weight"],\n                "sat_nat_policy": "native_token_objectives_without_causal_logit_kd",\n            },\n            "architecture_relation": {\n                "strict_parameter_subset": False,\n                "standalone_detachable_checkpoint": True,\n                "shared_weights_at_inference": False,\n                "shared_kv_cache_at_inference": False,\n                "paper_speculative_cache_claimed": False,\n            },\n        }\n        value["contract_sha256"] = ns["_det50_json_sha256"](value)\n        return value\n\n    def validate_extension(value, schedule):\n        if not isinstance(value, dict):\n            raise RuntimeError("detachable-50m post-hoc Matryoshka contract missing")\n        raw = copy.deepcopy(value)\n        digest = str(raw.pop("contract_sha256", "") or "")\n        if digest != ns["_det50_json_sha256"](raw):\n            raise RuntimeError("detachable-50m post-hoc Matryoshka digest mismatch")\n        expected = extension_contract(schedule)\n        if value != expected:\n            raise RuntimeError("detachable-50m post-hoc Matryoshka contract changed")\n        return copy.deepcopy(value)\n\n    def manifest(optimizer_name, alibi_mode, alibi_scale, schedule):\n        schedule = validate_schedule(schedule)\n        value = base_manifest(optimizer_name, alibi_mode, alibi_scale, schedule)\n        value[EXTENSION_KEY] = extension_contract(schedule)\n        value.pop("manifest_sha256", None)\n        value["manifest_sha256"] = ns["_det50_json_sha256"](value)\n        return value\n\n    def validate_manifest(value):\n        # The v27 validator remains authoritative for architecture, optimizer,\n        # multimode, tokenizer and NAT qualification contracts.  The extra\n        # objective contract is additive, digest-bound and export-compatible.\n        validated = base_validate_manifest(value)\n        extension = validated.get(EXTENSION_KEY)\n        if extension is not None:\n            validated["schedule"] = validate_schedule(validated["schedule"])\n            validated[EXTENSION_KEY] = validate_extension(\n                extension, validated["schedule"])\n        return validated\n\n    class PosthocMatryoshkaRuntime(BaseRuntime):\n        def __init__(self, args, mature_d, device):\n            self.allow_logit_upgrade = bool(getattr(\n                args, "detachable_50m_upgrade_logit_distill", False))\n            self._active_teacher_logits = None\n            self._last_logit_kd_metrics = None\n            super().__init__(args, mature_d, device)\n            self._ensure_logit_counters(upgraded=False)\n            print("[detachable-50m-posthoc-matryoshka-contract] "\n                  + ns["json"].dumps({\n                      "schema": EXTENSION_SCHEMA,\n                      "fix_id": FIX_ID,\n                      "paper_reference": PAPER,\n                      "method": "mature_1p1b_to_new_49p1m_output_distillation",\n                      "strict_parameter_subset": False,\n                      "logit_distillation": self.manifest["schedule"][\n                          "logit_distillation"],\n                      "parent_trainable_by_popup": False,\n                  }, sort_keys=True, separators=(",", ":")), flush=True)\n\n        def _ensure_logit_counters(self, upgraded, source_manifest_sha256=""):\n            current = self.counters.get("posthoc_matryoshka_logit_distillation")\n            if not isinstance(current, dict):\n                current = {\n                    "schema": COUNTERS_SCHEMA,\n                    "fix_id": FIX_ID,\n                    "activation_popup_commit": int(\n                        self.counters.get("popup_commits", 0)),\n                    "logit_distill_commits": 0,\n                    "logit_distill_target_tokens": 0,\n                    "distill_loss_sum": 0.0,\n                    "teacher_entropy_sum": 0.0,\n                    "teacher_student_kl_sum": 0.0,\n                    "top1_agreement_token_sum": 0.0,\n                    "source_manifest_sha256": str(source_manifest_sha256 or ""),\n                    "migration": ("v2_hidden_only_to_posthoc_logit_kd"\n                                  if upgraded else "native_v27_6"),\n                }\n                self.counters["posthoc_matryoshka_logit_distillation"] = current\n            if (current.get("schema") != COUNTERS_SCHEMA\n                    or current.get("fix_id") != FIX_ID):\n                raise RuntimeError(\n                    "detachable-50m post-hoc Matryoshka counters changed")\n            for key in ("activation_popup_commit", "logit_distill_commits",\n                        "logit_distill_target_tokens"):\n                value = current.get(key)\n                if type(value) is not int or value < 0:\n                    raise RuntimeError(f"invalid post-hoc Matryoshka counter {key}")\n            for key in ("distill_loss_sum", "teacher_entropy_sum",\n                        "teacher_student_kl_sum", "top1_agreement_token_sum"):\n                value = float(current.get(key, float("nan")))\n                if not math.isfinite(value) or value < 0.0:\n                    raise RuntimeError(f"invalid post-hoc Matryoshka sum {key}")\n                current[key] = value\n            return current\n\n        def restore(self, checkpoint):\n            raw_manifest = checkpoint.get(ns["_DET50_MANIFEST_KEY"])\n            source_validated = base_validate_manifest(raw_manifest)\n            source_has_extension = EXTENSION_KEY in source_validated\n            if not source_has_extension and not self.allow_logit_upgrade:\n                raise RuntimeError(\n                    "existing detachable-50m v2 requires explicit "\n                    "--detachable_50m_upgrade_logit_distill")\n            source_sha = str(source_validated.get("manifest_sha256") or "")\n            super().restore(checkpoint)\n            self._ensure_logit_counters(\n                upgraded=not source_has_extension,\n                source_manifest_sha256=source_sha)\n            if not source_has_extension:\n                migration = self.counters.setdefault("resume_migration", {})\n                migration["posthoc_matryoshka_logit_distillation"] = {\n                    "schema": "agillm5.detachable-50m.logit-kd-migration.v1",\n                    "from": "v2_hidden_representation_distillation",\n                    "to": EXTENSION_SCHEMA,\n                    "source_manifest_sha256": source_sha,\n                    "activation_popup_commit": int(\n                        self.counters.get("popup_commits", 0)),\n                    "teacher_packet_schema": TEACHER_PACKET_SCHEMA,\n                    "parent_weights_reset": False,\n                    "student_weights_reset": False,\n                    "optimizer_state_preserved": True,\n                }\n            schedule = validate_schedule(self.manifest["schedule"])\n            parent = self.manifest["parent_contract"]\n            self.manifest = manifest(\n                self.manifest["optimizer"]["name"],\n                parent["alibi_mode"], parent["alibi_scale"], schedule)\n            self.resume_migration = copy.deepcopy(\n                self.counters.get("resume_migration"))\n            self.restored = True\n\n        def _select_trainable(self, layer_index, sublayer, full_stack,\n                              popup_mode="ar"):\n            super()._select_trainable(\n                layer_index, sublayer, full_stack, popup_mode)\n            hidden_aux = float(self.manifest["schedule"][\n                "logit_distillation"]["hidden_aux_weight"])\n            if popup_mode == "ar" and hidden_aux <= 0.0:\n                self.bridge.norm.requires_grad_(False)\n                self.bridge.proj.requires_grad_(False)\n\n        def _objective(self, args, mode, ids, teacher_hidden,\n                       teacher_loss_mask, layer_index, sublayer, full_stack):\n            if mode != "ar":\n                base_obj = super()._objective(\n                    args, mode, ids, teacher_hidden, teacher_loss_mask,\n                    layer_index, sublayer, full_stack)\n                teacher_logits = self._active_teacher_logits\n                kd = self.manifest["schedule"]["logit_distillation"]\n                distill_multiplier = float(base_obj.get("distill_multiplier", 0.0))\n                \n                if torch.is_tensor(teacher_logits) and distill_multiplier > 0.0:\n                    student_hidden = base_obj["student_hidden"]\n                    targets = base_obj["targets"]\n                    vocabulary = (self.model.emb.weight if full_stack\n                                  else self.model.emb.weight.detach())\n                    student_logits = F.linear(student_hidden, vocabulary, None).float()\n                    \n                    terms = _logit_kd_terms(\n                        torch, F, student_logits, teacher_logits, targets,\n                        kd["alpha"], kd["temperature"])\n                        \n                    base_obj["distill_loss"] = terms["distill_loss"]\n                    token_weight = float(base_obj["token_weight"])\n                    distill_weight = float(base_obj["distill_weight"])\n                    combined = token_weight * terms["student_ce"] + distill_weight * distill_multiplier * terms["distill_loss"]\n                    \n                    if base_obj.get("gate_loss") is not None:\n                        mm = self.manifest["schedule"]["multimode"]\n                        combined = combined + float(mm["sat_variable_gate_weight"]) * base_obj["gate_loss"]\n                        \n                    base_obj["combined_loss"] = combined\n                    base_obj["student_ce"] = terms["student_ce"]\n                    base_obj["logit_distillation"] = True\n                    base_obj["logit_distill_alpha"] = float(kd["alpha"])\n                    base_obj["logit_distill_temperature"] = float(kd["temperature"])\n                    base_obj["teacher_entropy"] = terms["teacher_entropy"]\n                    base_obj["teacher_student_kl"] = terms["teacher_student_kl"]\n                    base_obj["top1_agreement"] = terms["top1_agreement"]\n                    \n                    self._last_logit_kd_metrics = {\n                        "schema": EXTENSION_SCHEMA,\n                        "fix_id": FIX_ID,\n                        "alpha": float(kd["alpha"]),\n                        "temperature": float(kd["temperature"]),\n                        "target_tokens": int(targets.numel()),\n                        "teacher_entropy": float(terms["teacher_entropy"].detach()),\n                        "teacher_student_kl": float(terms["teacher_student_kl"].detach()),\n                        "top1_agreement": float(terms["top1_agreement"].detach()),\n                        "distill_ce_unscaled": float(terms["distill_ce_unscaled"].detach()),\n                        "distill_loss_t2": float(terms["distill_loss"].detach()),\n                        "hidden_aux_weight": float(kd["hidden_aux_weight"]),\n                        "teacher_logits_pre_parent_commit": True,\n                        "exact_full_vocabulary": True,\n                        "strict_parameter_subset": False,\n                    }\n                return base_obj\n            teacher_logits = self._active_teacher_logits\n            kd = self.manifest["schedule"]["logit_distillation"]\n            if not torch.is_tensor(teacher_logits):\n                raise RuntimeError("AR update lacks mature teacher logits")\n            if (teacher_logits.ndim != 3\n                    or teacher_logits.size(0) != ids.size(0)\n                    or teacher_logits.size(-1)\n                    != int(ns["_DET50_CONFIG"]["vocab_size"])\n                    or teacher_logits.requires_grad\n                    or teacher_logits.grad_fn is not None):\n                raise RuntimeError("AR mature teacher-logit contract is invalid")\n\n            attention = ns["causal_mask"](ids.size(1), structured=False)\n            sequence = (self.model.full_hidden(ids, attention, True)\n                        if full_stack else self.model.local_hidden(\n                            ids, attention, layer_index, sublayer))\n            positions = min(\n                int(ids.size(1)) - 1,\n                int(teacher_logits.size(1)),\n                int(kd["max_tokens"]),\n                int(self.manifest["schedule"]["loss_tokens"]),\n            )\n            if positions <= 0:\n                raise RuntimeError("AR logit distillation has no aligned targets")\n            student_hidden = sequence[:, :positions]\n            teacher_hidden_rows = teacher_hidden[:, :positions]\n            teacher_logits = teacher_logits[:, :positions].to(\n                student_hidden.device, non_blocking=True)\n            targets = ids[:, 1:positions + 1]\n            if teacher_loss_mask is not None:\n                valid = teacher_loss_mask[:, :positions].bool()\n                student_hidden = student_hidden[valid]\n                teacher_hidden_rows = teacher_hidden_rows[valid]\n                teacher_logits = teacher_logits[valid]\n                targets = targets[valid]\n            student_hidden = student_hidden.reshape(-1, 256)\n            teacher_hidden_rows = teacher_hidden_rows.reshape(-1, 1280)\n            teacher_logits = teacher_logits.reshape(\n                -1, int(ns["_DET50_CONFIG"]["vocab_size"]))\n            targets = targets.reshape(-1)\n            cap = min(\n                int(kd["max_tokens"]),\n                int(self.manifest["schedule"]["loss_tokens"]),\n                int(targets.numel()),\n            )\n            student_hidden = student_hidden[:cap]\n            teacher_hidden_rows = teacher_hidden_rows[:cap]\n            teacher_logits = teacher_logits[:cap]\n            targets = targets[:cap]\n            if targets.numel() == 0:\n                raise RuntimeError("AR logit distillation has no supervised rows")\n\n            vocabulary = (self.model.emb.weight if full_stack\n                          else self.model.emb.weight.detach())\n            student_logits = F.linear(student_hidden, vocabulary, None).float()\n            terms = _logit_kd_terms(\n                torch, F, student_logits, teacher_logits, targets,\n                kd["alpha"], kd["temperature"])\n            hidden_aux_weight = float(kd["hidden_aux_weight"])\n            if hidden_aux_weight > 0.0:\n                projected = self.bridge.proj(self.bridge.norm(student_hidden))\n                student_unit = F.normalize(projected.float(), dim=-1, eps=1e-6)\n                teacher_unit = F.normalize(\n                    teacher_hidden_rows.detach().float(), dim=-1, eps=1e-6)\n                normalized_mse = F.mse_loss(student_unit, teacher_unit)\n                cosine_loss = (1.0 - (student_unit * teacher_unit).sum(-1)).mean()\n                hidden_distill = 0.5 * (normalized_mse + cosine_loss)\n            else:\n                normalized_mse = terms["student_ce"].detach().new_zeros(())\n                cosine_loss = terms["student_ce"].detach().new_zeros(())\n                hidden_distill = terms["student_ce"].detach().new_zeros(())\n            token_weight = float(self.manifest["schedule"]["multimode"][\n                "token_loss_weights"]["ar"])\n            combined = (token_weight * terms["convex_loss"]\n                        + hidden_aux_weight * hidden_distill)\n            self._last_logit_kd_metrics = {\n                "schema": EXTENSION_SCHEMA,\n                "fix_id": FIX_ID,\n                "alpha": float(kd["alpha"]),\n                "temperature": float(kd["temperature"]),\n                "target_tokens": int(targets.numel()),\n                "teacher_entropy": float(terms["teacher_entropy"].detach()),\n                "teacher_student_kl": float(\n                    terms["teacher_student_kl"].detach()),\n                "top1_agreement": float(terms["top1_agreement"].detach()),\n                "distill_ce_unscaled": float(\n                    terms["distill_ce_unscaled"].detach()),\n                "distill_loss_t2": float(terms["distill_loss"].detach()),\n                "hidden_aux_weight": hidden_aux_weight,\n                "teacher_logits_pre_parent_commit": True,\n                "exact_full_vocabulary": True,\n                "strict_parameter_subset": False,\n            }\n            return {\n                "student_ce": terms["student_ce"],\n                "normalized_mse": normalized_mse,\n                "cosine_loss": cosine_loss,\n                "distill_loss": terms["distill_loss"],\n                "combined_loss": combined,\n                "targets": targets,\n                "gate_loss": None,\n                "gate_info": None,\n                "distill_weight": float(kd["alpha"]),\n                "distill_multiplier": 1.0,\n                "token_weight": token_weight,\n                "nat_refinement_passes": 0,\n                "sat_phase": None,\n                "logit_distillation": True,\n                "logit_distill_alpha": float(kd["alpha"]),\n                "logit_distill_temperature": float(kd["temperature"]),\n                "teacher_entropy": terms["teacher_entropy"],\n                "teacher_student_kl": terms["teacher_student_kl"],\n                "top1_agreement": terms["top1_agreement"],\n            }\n\n        def _commit_mode_metrics(self, mode, objective):\n            super()._commit_mode_metrics(mode, objective)\n            if objective.get("logit_distillation") is not True:\n                return\n            counters = self._ensure_logit_counters(upgraded=False)\n            tokens = int(objective["targets"].numel())\n            counters["logit_distill_commits"] += 1\n            counters["logit_distill_target_tokens"] += tokens\n            counters["distill_loss_sum"] += float(\n                objective["distill_loss"].detach().float().item())\n            counters["teacher_entropy_sum"] += float(\n                objective["teacher_entropy"].detach().float().item())\n            counters["teacher_student_kl_sum"] += float(\n                objective["teacher_student_kl"].detach().float().item())\n            counters["top1_agreement_token_sum"] += tokens * float(\n                objective["top1_agreement"].detach().float().item())\n\n        def _record(self, args, receipt, *, control_flow=False,\n                    immediate=False):\n            if (isinstance(receipt, dict)\n                    and self._last_logit_kd_metrics is not None):\n                receipt["posthoc_matryoshka_logit_distillation"] = copy.deepcopy(\n                    self._last_logit_kd_metrics)\n                receipt["student_distillation_family"] = (\n                    "posthoc_matryoshka_teacher_output")\n                receipt["student_logit_distill_alpha"] = float(\n                    self._last_logit_kd_metrics["alpha"])\n                receipt["student_logit_distill_temperature"] = float(\n                    self._last_logit_kd_metrics["temperature"])\n                receipt["teacher_student_top1_agreement"] = float(\n                    self._last_logit_kd_metrics["top1_agreement"])\n                receipt["teacher_student_kl"] = float(\n                    self._last_logit_kd_metrics["teacher_student_kl"])\n            return super()._record(\n                args, receipt, control_flow=control_flow, immediate=immediate)\n\n        def train_after_commit(self, args, parent_state, parent_step,\n                               mature_loss, teacher_packet):\n            self._active_teacher_logits = None\n            self._last_logit_kd_metrics = None\n            if isinstance(teacher_packet, dict):\n                mapping = self.peek_mapping(args)\n                popup_mode = str(mapping.get("popup_mode", "ar") or "ar")\n                if teacher_packet.get("schema") != TEACHER_PACKET_SCHEMA:\n                    rejected = dict(teacher_packet)\n                    rejected["schema"] = (\n                        "agillm5.detachable-50m.teacher-packet.unsupported")\n                    return super().train_after_commit(\n                        args, parent_state, parent_step, mature_loss, rejected)\n                if True:\n                    teacher_logits = teacher_packet.get("teacher_logits")\n                    if (not torch.is_tensor(teacher_logits)\n                            or teacher_logits.ndim != 3\n                            or teacher_logits.size(-1)\n                            != int(ns["_DET50_CONFIG"]["vocab_size"])\n                            or teacher_logits.requires_grad\n                            or teacher_logits.grad_fn is not None\n                            or teacher_packet.get(\n                                "teacher_logits_pre_parent_commit") is not True\n                            or int(teacher_packet.get("teacher_vocab_size", -1))\n                            != int(ns["_DET50_CONFIG"]["vocab_size"])):\n                        rejected = dict(teacher_packet)\n                        rejected["schema"] = (\n                            "agillm5.detachable-50m.teacher-packet.bad-logits")\n                        return super().train_after_commit(\n                            args, parent_state, parent_step, mature_loss, rejected)\n                    self._active_teacher_logits = teacher_logits.detach()\n                legacy_packet = dict(teacher_packet)\n                legacy_packet["schema"] = (\n                    "agillm5.detachable-50m.teacher-packet.v1")\n            else:\n                legacy_packet = teacher_packet\n            try:\n                return super().train_after_commit(\n                    args, parent_state, parent_step, mature_loss, legacy_packet)\n            finally:\n                self._active_teacher_logits = None\n                self._last_logit_kd_metrics = None\n\n    ns["_det50_schedule_from_args_pre_logit_kd"] = base_schedule_from_args\n    ns["_det50_validate_schedule_pre_logit_kd"] = base_validate_schedule\n    ns["_det50_manifest_pre_logit_kd"] = base_manifest\n    ns["_det50_validate_manifest_pre_logit_kd"] = base_validate_manifest\n    ns["_det50_schedule_from_args"] = schedule_from_args\n    ns["_det50_validate_schedule"] = validate_schedule\n    ns["_det50_apply_schedule_to_args"] = apply_schedule\n    ns["_det50_manifest"] = manifest\n    ns["_det50_validate_manifest"] = validate_manifest\n    ns["_det50_posthoc_matryoshka_logit_kd"] = _logit_kd_terms\n    ns["_DET50_POSTHOC_MATRYOSHKA_KEY"] = EXTENSION_KEY\n    ns["_DET50_POSTHOC_MATRYOSHKA_SCHEMA"] = EXTENSION_SCHEMA\n    ns["_DET50_TEACHER_PACKET_SCHEMA"] = TEACHER_PACKET_SCHEMA\n    ns["Detachable50MRuntime"] = PosthocMatryoshkaRuntime\n    ns["_DET50_POSTHOC_MATRYOSHKA_V27_6_INSTALLED"] = True\n'
+_agillm_sf_module = _agillm_sf_types.ModuleType('det50_posthoc_matryoshka_v27_6_overlay')
+_agillm_sf_module.__file__ = __file__ + '#det50_posthoc_matryoshka_v27_6_overlay.py'
+_agillm_sf_module.__package__ = ''
+_agillm_sf_module.__dict__.update(_AGILLM_SF_SEED_BYTES=_AGILLM_SF_SEED_BYTES, _AGILLM_SF_IO=_agillm_sf_io)
+_agillm_sf_linecache.cache[_agillm_sf_module.__file__] = (len(_AGILLM_SF_SOURCE), None, _AGILLM_SF_SOURCE.splitlines(True), _agillm_sf_module.__file__)
+_agillm_sf_sys.modules['det50_posthoc_matryoshka_v27_6_overlay'] = _agillm_sf_module
+exec(compile(_AGILLM_SF_SOURCE, _agillm_sf_module.__file__, 'exec'), _agillm_sf_module.__dict__)
+_agillm_sf_module.install(globals())
+
+# Folded module: det50_sat_gate_v27_13_overlay
+_AGILLM_SF_SOURCE = '"""Additive v27.13 migration for the detachable-50M SAT-variable gate.\n\nThe v26/v27.6 gate labelled whether the second drafted token was exactly right,\nbut classified that label from the first drafted token\'s hidden state.  This\noverlay migrates only the 514-parameter gate to the second token\'s final\nfull-stack evaluation hidden state, resets only its optimizer moments and\nrouting counters, and binds the change into the signed model manifest.\n"""\nfrom __future__ import annotations\n\nimport copy\nimport hashlib\nimport json\nimport math\nimport os\nimport pathlib\nimport re\n\nEXTENSION_KEY = "agillm5_detachable_50m_sat_gate_v27_13"\nEXTENSION_SCHEMA = "agillm5.detachable-50m.sat-gate-v27.13.v1"\nCOUNTERS_KEY = "sat_gate_v27_13"\nCOUNTERS_SCHEMA = "agillm5.detachable-50m.sat-gate-v27.13-counters.v1"\nMIGRATION_SCHEMA = "agillm5.detachable-50m.sat-gate-v27.13-migration.v1"\nFIX_ID = "v27.13-second-hidden-precision-failclosed-20260903"\nFEATURE_SOURCE = "detached_second_draft_final_fullstack_eval_hidden"\nLABEL_CONTRACT = "second_draft_exact_tied_vocab_top1_equals_gold2"\nTHRESHOLD = 0.999\nSEED_FILE = "sat_gate_v27_13_seed.npz"\nSEED_SHA256 = "9262ea3fc5cc7e4d3dc5d14aac125bd5459ce314cac05c3c11de45224e14dd94"\nSOURCE_CHECKPOINT_SHA_ENV = "AGILLM43_DETACHABLE50M_GATE_V2713_START_CHECKPOINT_SHA256"\nSTUDY_EVIDENCE = {\n    "development_corpus_a_sha256": "aa3060e5127eb1c393c91544db11a1ebe3a319bdebdc06e09b3459691301e0b4",\n    "development_corpus_b_sha256": "80007b03a2196ab14cac7bbc4c6372fd84d2f96b53d3eba6908dbb85ef32385c",\n    "seed_study_sha256": "9262ea3fc5cc7e4d3dc5d14aac125bd5459ce314cac05c3c11de45224e14dd94",\n    "cross_corpus_false_accept_rate_min": 0.042641201103053826,\n    "cross_corpus_false_accept_rate_max": 0.04319287147569976,\n    "cross_corpus_balanced_accuracy_min": 0.5756181749586772,\n    "cross_corpus_balanced_accuracy_max": 0.5866760703448752,\n    "cross_corpus_roc_auc_min": 0.7203464829911129,\n    "cross_corpus_roc_auc_max": 0.7243670535960836,\n    "precision_calibration_sha256": "de28fb279af7b5310262e9d8ff382d35632c9e5b60428c57c9b2e6988ed43e01",\n    "precision_calibration_blocks": 40000,\n    "precision_calibration_positives": 552,\n    "precision_calibration_result": "no_threshold_positive_net_benefit",\n    "development_seed_threshold_rejected": 0.7008123397827148,\n    "serving_release_threshold": 0.999,\n    "routing_release_state": "training-only-fail-closed",\n    "protected_release_holdout_used": False,\n}\n\n\ndef install(ns):\n    if ns.get("_DET50_SAT_GATE_V27_13_INSTALLED"):\n        return\n\n    torch = ns["torch"]\n    np = ns["np"]\n    BaseRuntime = ns["Detachable50MRuntime"]\n    base_manifest = ns["_det50_manifest"]\n    base_validate_manifest = ns["_det50_validate_manifest"]\n\n    def _sha256_file(path):\n        digest = hashlib.sha256()\n        with pathlib.Path(path).open("rb") as handle:\n            for block in iter(lambda: handle.read(8 << 20), b""):\n                digest.update(block)\n        return digest.hexdigest()\n\n    def extension_contract(schedule):\n        threshold = float(schedule["multimode"]["sat_variable_stride2_threshold"])\n        value = {\n            "schema": EXTENSION_SCHEMA,\n            "fix_id": FIX_ID,\n            "feature_source": FEATURE_SOURCE,\n            "serving_hidden_buffer_index": 1,\n            "label_contract": LABEL_CONTRACT,\n            "gate_train_modes": ["sat_fixed", "sat_variable"],\n            "gate_parameters": 514,\n            "gate_hidden_width": 256,\n            "stride2_threshold": threshold,\n            "seed_file": SEED_FILE,\n            "seed_sha256": SEED_SHA256,\n            "development_evidence": copy.deepcopy(STUDY_EVIDENCE),\n            "parent_weights_reset": False,\n            "student_core_weights_reset": False,\n            "student_core_optimizer_state_preserved": True,\n            "gate_optimizer_state_reset": True,\n            "release_holdout_status": "untouched_pending_frozen_candidate",\n            "routing_release_state": "training-only-fail-closed",\n            "stride2_enabled": False,\n            "precision_calibration_sha256": STUDY_EVIDENCE["precision_calibration_sha256"],\n        }\n        value["contract_sha256"] = ns["_det50_json_sha256"](value)\n        return value\n\n    def validate_extension(value, schedule):\n        expected = extension_contract(schedule)\n        if value != expected:\n            raise RuntimeError("detachable-50m v27.13 SAT gate contract changed")\n        return copy.deepcopy(value)\n\n    def manifest(optimizer_name, alibi_mode, alibi_scale, schedule):\n        value = base_manifest(optimizer_name, alibi_mode, alibi_scale, schedule)\n        value[EXTENSION_KEY] = extension_contract(value["schedule"])\n        value.pop("manifest_sha256", None)\n        value["manifest_sha256"] = ns["_det50_json_sha256"](value)\n        return value\n\n    def validate_manifest(value):\n        validated = base_validate_manifest(value)\n        extension = validated.get(EXTENSION_KEY)\n        if extension is not None:\n            validated[EXTENSION_KEY] = validate_extension(\n                extension, validated["schedule"])\n        return validated\n\n    def _empty_gate_counters(bins):\n        return {\n            "blocks": 0,\n            "stride1_labels": 0,\n            "stride2_labels": 0,\n            "predicted_stride1": 0,\n            "predicted_stride2": 0,\n            "correct": 0,\n            "false_accepts": 0,\n            "false_rejects": 0,\n            "brier_sum": 0.0,\n            "probability_stride2_sum": 0.0,\n            "calibration_bins": [\n                {"count": 0, "probability_sum": 0.0, "label_sum": 0}\n                for _ in range(int(bins))\n            ],\n            "last_class_weights": [1.0, 1.0],\n            "last_threshold": THRESHOLD,\n        }\n\n    def _optimizer_state_sha256(optimizer, parameters):\n        digest = hashlib.sha256(b"agillm5.det50.optimizer-subset.v1\\0")\n        for position, parameter in enumerate(parameters):\n            digest.update(position.to_bytes(8, "big"))\n            state = optimizer.state.get(parameter, {})\n            if not isinstance(state, dict):\n                raise RuntimeError("detachable-50m optimizer state is malformed")\n            for key in sorted(state, key=str):\n                digest.update(str(key).encode("utf-8") + b"\\0")\n                value = state[key]\n                if torch.is_tensor(value):\n                    tensor = value.detach().to(device="cpu").contiguous()\n                    digest.update(str(tensor.dtype).encode("ascii") + b"\\0")\n                    digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))\n                    digest.update(b"\\0")\n                    digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))\n                elif isinstance(value, (bool, int, float, str)):\n                    digest.update(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))\n                elif value is None:\n                    digest.update(b"null")\n                else:\n                    raise RuntimeError(\n                        "detachable-50m optimizer state contains unsupported value")\n                digest.update(b"\\0")\n        return digest.hexdigest()\n\n    def _gate_state(runtime):\n        return {\n            "weight": runtime.bridge.export_sat_gate.weight.detach(),\n            "bias": runtime.bridge.export_sat_gate.bias.detach(),\n        }\n\n    def _online_summary(runtime):\n        gate = runtime.counters["sat_variable_gate"]\n        negatives = int(gate.get("stride1_labels", 0))\n        positives = int(gate.get("stride2_labels", 0))\n        fp = int(gate.get("false_accepts", 0))\n        fn = int(gate.get("false_rejects", 0))\n        tp = max(0, positives - fn)\n        tn = max(0, negatives - fp)\n        fpr = fp / max(1, fp + tn)\n        tpr = tp / max(1, tp + fn)\n        balanced = 0.5 * (tpr + tn / max(1, tn + fp))\n        blocks = negatives + positives\n        return {\n            "blocks": blocks,\n            "stride1_labels": negatives,\n            "stride2_labels": positives,\n            "predicted_stride1": int(gate.get("predicted_stride1", 0)),\n            "predicted_stride2": int(gate.get("predicted_stride2", 0)),\n            "false_accepts": fp,\n            "false_rejects": fn,\n            "false_accept_rate": fpr,\n            "true_accept_rate": tpr,\n            "balanced_accuracy": balanced,\n            "threshold": float(gate.get("last_threshold", THRESHOLD)),\n            # This is in-training telemetry, not held-out release evidence.\n            "online_sanity_passed": False,\n            "online_precision": tp / max(1, tp + fp),\n            "online_net_correct_minus_wrong": tp - fp,\n            "routing_release_state": "training-only-fail-closed",\n            "heldout_qualification": False,\n        }\n\n    def _validate_counter(value):\n        if (not isinstance(value, dict)\n                or value.get("schema") != COUNTERS_SCHEMA\n                or value.get("fix_id") != FIX_ID\n                or value.get("feature_source") != FEATURE_SOURCE\n                or value.get("label_contract") != LABEL_CONTRACT\n                or value.get("seed_sha256") != SEED_SHA256\n                or not math.isclose(float(value.get("threshold", float("nan"))),\n                                    THRESHOLD, rel_tol=0.0, abs_tol=1e-12)):\n            raise RuntimeError("detachable-50m v27.13 SAT gate counters changed")\n        for key in ("activation_parent_step", "activation_popup_commit",\n                    "sat_fixed_gate_commits", "sat_variable_gate_commits"):\n            if type(value.get(key)) is not int or int(value[key]) < -1:\n                raise RuntimeError(f"invalid detachable-50m v27.13 counter {key}")\n        for key in ("activation_source_checkpoint_sha256",\n                    "activation_source_manifest_sha256", "old_gate_state_sha256",\n                    "seed_gate_state_sha256", "student_core_state_sha256",\n                    "student_core_optimizer_state_sha256"):\n            if not re.fullmatch(r"[0-9a-f]{64}", str(value.get(key) or "")):\n                raise RuntimeError(f"invalid detachable-50m v27.13 digest {key}")\n        return value\n\n    def _load_seed(runtime):\n        path = str(__file__) + "#" + SEED_FILE\n        if hashlib.sha256(_AGILLM_SF_SEED_BYTES).hexdigest() != SEED_SHA256:\n            raise RuntimeError("detachable-50m v27.13 SAT gate seed digest mismatch")\n        with np.load(_AGILLM_SF_IO.BytesIO(_AGILLM_SF_SEED_BYTES), allow_pickle=False) as payload:\n            if set(payload.files) != {"weight", "bias", "threshold"}:\n                raise RuntimeError("detachable-50m v27.13 SAT gate seed fields changed")\n            weight = np.asarray(payload["weight"], dtype=np.float32)\n            bias = np.asarray(payload["bias"], dtype=np.float32)\n            threshold = np.asarray(payload["threshold"], dtype=np.float32)\n        if weight.shape != (256,) or bias.shape != (1,) or threshold.shape != (1,):\n            raise RuntimeError("detachable-50m v27.13 SAT gate seed shapes changed")\n        if (not np.isfinite(weight).all() or not np.isfinite(bias).all()\n                or not np.isfinite(threshold).all()\n                or not math.isclose(float(threshold[0]), THRESHOLD,\n                                    rel_tol=0.0, abs_tol=1e-7)):\n            raise RuntimeError("detachable-50m v27.13 SAT gate seed values changed")\n        with torch.no_grad():\n            gate = runtime.bridge.export_sat_gate\n            gate.weight.zero_()\n            gate.bias.zero_()\n            gate.weight[1].copy_(torch.from_numpy(weight).to(\n                device=gate.weight.device, dtype=gate.weight.dtype))\n            gate.bias[1].copy_(torch.tensor(float(bias[0]),\n                device=gate.bias.device, dtype=gate.bias.dtype))\n        return path\n\n    class SatGateV2713Runtime(BaseRuntime):\n        def __init__(self, args, mature_d, device):\n            self.allow_sat_gate_v2713_upgrade = bool(getattr(\n                args, "detachable_50m_upgrade_sat_gate_v2713", False))\n            super().__init__(args, mature_d, device)\n\n        def restore(self, checkpoint):\n            raw_manifest = checkpoint.get(ns["_DET50_MANIFEST_KEY"])\n            source_validated = base_validate_manifest(raw_manifest)\n            source_has_extension = EXTENSION_KEY in source_validated\n            if not source_has_extension and not self.allow_sat_gate_v2713_upgrade:\n                raise RuntimeError(\n                    "existing detachable-50m checkpoint requires explicit "\n                    "--detachable_50m_upgrade_sat_gate_v2713")\n            source_manifest_sha = str(source_validated.get("manifest_sha256") or "")\n            super().restore(checkpoint)\n            if source_has_extension:\n                validate_extension(\n                    source_validated[EXTENSION_KEY], source_validated["schedule"])\n                counter = _validate_counter(self.counters.get(COUNTERS_KEY))\n                if not math.isclose(\n                        float(self.manifest["schedule"]["multimode"][\n                            "sat_variable_stride2_threshold"]), THRESHOLD,\n                        rel_tol=0.0, abs_tol=1e-12):\n                    raise RuntimeError("detachable-50m v27.13 threshold changed on resume")\n                gate_digest = ns["_det50_state_dict_sha256"](_gate_state(self))\n                expected = str(counter.get("last_checkpoint_gate_state_sha256") or "")\n                if expected and gate_digest != expected:\n                    raise RuntimeError("detachable-50m v27.13 restored gate state digest mismatch")\n            else:\n                source_checkpoint_sha = str(os.environ.get(\n                    SOURCE_CHECKPOINT_SHA_ENV, "") or "")\n                if not re.fullmatch(r"[0-9a-f]{64}", source_checkpoint_sha):\n                    raise RuntimeError(\n                        "detachable-50m v27.13 migration requires exact "\n                        + SOURCE_CHECKPOINT_SHA_ENV)\n                model_before = ns["_det50_state_dict_sha256"](\n                    self.model.state_dict())\n                gate_before = ns["_det50_state_dict_sha256"](_gate_state(self))\n                core_parameters = list(self.optimizer.param_groups[0]["params"])\n                core_optimizer_before = _optimizer_state_sha256(\n                    self.optimizer, core_parameters)\n                _load_seed(self)\n                gate_parameters = list(self.bridge.export_sat_gate.parameters())\n                cleared = 0\n                for parameter in gate_parameters:\n                    parameter.grad = None\n                    if parameter in self.optimizer.state:\n                        del self.optimizer.state[parameter]\n                        cleared += 1\n                core_optimizer_after = _optimizer_state_sha256(\n                    self.optimizer, core_parameters)\n                model_after = ns["_det50_state_dict_sha256"](\n                    self.model.state_dict())\n                if model_before != model_after:\n                    raise RuntimeError("detachable-50m v27.13 migration changed student core")\n                if core_optimizer_before != core_optimizer_after:\n                    raise RuntimeError(\n                        "detachable-50m v27.13 migration changed student core optimizer")\n                mm = self.manifest["schedule"]["multimode"]\n                old_threshold = float(mm["sat_variable_stride2_threshold"])\n                mm["sat_variable_stride2_threshold"] = THRESHOLD\n                bins = int(mm["sat_variable_calibration_bins"])\n                self.counters["sat_variable_gate"] = _empty_gate_counters(bins)\n                seed_gate_sha = ns["_det50_state_dict_sha256"](_gate_state(self))\n                counter = {\n                    "schema": COUNTERS_SCHEMA,\n                    "fix_id": FIX_ID,\n                    "feature_source": FEATURE_SOURCE,\n                    "label_contract": LABEL_CONTRACT,\n                    "threshold": THRESHOLD,\n                    "seed_sha256": SEED_SHA256,\n                    "activation_source_checkpoint_sha256": source_checkpoint_sha,\n                    "activation_source_manifest_sha256": source_manifest_sha,\n                    "activation_parent_step": int(\n                        self.counters.get("last_parent_step", -1)),\n                    "activation_popup_commit": int(\n                        self.counters.get("popup_commits", 0)),\n                    "sat_fixed_gate_commits": 0,\n                    "sat_variable_gate_commits": 0,\n                    "old_gate_state_sha256": gate_before,\n                    "seed_gate_state_sha256": seed_gate_sha,\n                    "student_core_state_sha256": model_after,\n                    "student_core_optimizer_state_sha256": core_optimizer_after,\n                    "gate_optimizer_states_cleared": int(cleared),\n                    "old_threshold": old_threshold,\n                    "last_checkpoint_gate_state_sha256": "",\n                    "online_summary": _online_summary(self),\n                    "heldout_qualification": False,\n                }\n                self.counters[COUNTERS_KEY] = counter\n                migration = self.counters.setdefault("resume_migration", {})\n                migration["sat_gate_v27_13"] = {\n                    "schema": MIGRATION_SCHEMA,\n                    "from_feature": "first_draft_final_fullstack_eval_hidden",\n                    "to_feature": FEATURE_SOURCE,\n                    "label_contract": LABEL_CONTRACT,\n                    "source_checkpoint_sha256": source_checkpoint_sha,\n                    "source_manifest_sha256": source_manifest_sha,\n                    "seed_sha256": SEED_SHA256,\n                    "old_gate_state_sha256": gate_before,\n                    "seed_gate_state_sha256": seed_gate_sha,\n                    "old_threshold": old_threshold,\n                    "new_threshold": THRESHOLD,\n                    "gate_optimizer_states_cleared": int(cleared),\n                    "parent_weights_reset": False,\n                    "student_core_weights_reset": False,\n                    "student_core_optimizer_state_preserved": True,\n                    "protected_release_holdout_used": False,\n                }\n            schedule = ns["_det50_validate_schedule"](self.manifest["schedule"])\n            parent = self.manifest["parent_contract"]\n            self.manifest = manifest(\n                self.manifest["optimizer"]["name"],\n                parent["alibi_mode"], parent["alibi_scale"], schedule)\n            self.resume_migration = copy.deepcopy(\n                self.counters.get("resume_migration"))\n            self.restored = True\n            print("[detachable-50m-sat-gate-v27.13-contract] " + json.dumps({\n                "schema": EXTENSION_SCHEMA,\n                "fix_id": FIX_ID,\n                "feature_source": FEATURE_SOURCE,\n                "label_contract": LABEL_CONTRACT,\n                "threshold": THRESHOLD,\n                "gate_train_modes": ["sat_fixed", "sat_variable"],\n                "gate_parameters": 514,\n                "parent_weights_reset": False,\n                "student_core_weights_reset": False,\n                "protected_release_holdout_used": False,\n            }, sort_keys=True, separators=(",", ":")), flush=True)\n\n        def _commit_mode_metrics(self, mode, objective):\n            super()._commit_mode_metrics(mode, objective)\n            if mode not in {"sat_fixed", "sat_variable"} or not objective.get("gate_info"):\n                return\n            counter = _validate_counter(self.counters.get(COUNTERS_KEY))\n            counter[f"{mode}_gate_commits"] += 1\n            counter["online_summary"] = _online_summary(self)\n\n        def _record(self, args, receipt, *, control_flow=False, immediate=False):\n            if isinstance(receipt, dict) and COUNTERS_KEY in self.counters:\n                receipt["sat_gate_v27_13"] = {\n                    "schema": EXTENSION_SCHEMA,\n                    "fix_id": FIX_ID,\n                    "feature_source": FEATURE_SOURCE,\n                    "label_contract": LABEL_CONTRACT,\n                    "threshold": THRESHOLD,\n                    "gate_train_modes": ["sat_fixed", "sat_variable"],\n                    "online_summary": copy.deepcopy(\n                        self.counters[COUNTERS_KEY].get("online_summary")),\n                    "heldout_qualification": False,\n                }\n            return super()._record(\n                args, receipt, control_flow=control_flow, immediate=immediate)\n\n        def checkpoint_payload(self):\n            counter = _validate_counter(self.counters.get(COUNTERS_KEY))\n            counter["online_summary"] = _online_summary(self)\n            counter["last_checkpoint_gate_state_sha256"] = (\n                ns["_det50_state_dict_sha256"](_gate_state(self)))\n            payload = super().checkpoint_payload()\n            payload[EXTENSION_KEY] = copy.deepcopy(counter)\n            return payload\n\n    ns["_det50_manifest_pre_sat_gate_v27_13"] = base_manifest\n    ns["_det50_validate_manifest_pre_sat_gate_v27_13"] = base_validate_manifest\n    ns["_det50_manifest"] = manifest\n    ns["_det50_validate_manifest"] = validate_manifest\n    ns["_DET50_SAT_GATE_V27_13_KEY"] = EXTENSION_KEY\n    ns["_DET50_SAT_GATE_V27_13_SCHEMA"] = EXTENSION_SCHEMA\n    ns["Detachable50MRuntime"] = SatGateV2713Runtime\n    ns["_DET50_SAT_GATE_V27_13_INSTALLED"] = True\n'
+_agillm_sf_module = _agillm_sf_types.ModuleType('det50_sat_gate_v27_13_overlay')
+_agillm_sf_module.__file__ = __file__ + '#det50_sat_gate_v27_13_overlay.py'
+_agillm_sf_module.__package__ = ''
+_agillm_sf_module.__dict__.update(_AGILLM_SF_SEED_BYTES=_AGILLM_SF_SEED_BYTES, _AGILLM_SF_IO=_agillm_sf_io)
+_agillm_sf_linecache.cache[_agillm_sf_module.__file__] = (len(_AGILLM_SF_SOURCE), None, _AGILLM_SF_SOURCE.splitlines(True), _agillm_sf_module.__file__)
+_agillm_sf_sys.modules['det50_sat_gate_v27_13_overlay'] = _agillm_sf_module
+exec(compile(_AGILLM_SF_SOURCE, _agillm_sf_module.__file__, 'exec'), _agillm_sf_module.__dict__)
+_agillm_sf_module.install(globals())
+
+# Folded module: det50_teacher_packet_all_fullstack_overlay
+_AGILLM_SF_SOURCE = '"""Emit detachable-50M teacher packets on SAT/NAT fullstack anchors too.\n\nRoot cause (live Vast 47086549): AR fullstack alone stashed teacher-packet.v2.\nFullstack round-robin is AR/SAT/NAT every=3 offsets 0/1/2, while\ntrain_after_commit runs after every mature commit. Exact miss ratio:\nteacher_packet_missing_skips ~= 2 * eligible_teacher_packets.\n\nv27.6.1b emitted hidden-only packets (teacher_logits=None,\nteacher_logits_pre_parent_commit=False). Posthoc v27.6 train_after_commit\nunconditionally requires 3-D stop-grad teacher_logits with\nteacher_logits_pre_parent_commit=True and matching teacher_vocab_size;\notherwise it rewrites schema to bad-logits → teacher_stale.\n\nv27.6.1c attaches pre-commit head logits from the captured fullstack hidden\n(same contract as the AR fullstack emit path) so SAT/NAT packets are accepted.\n"""\nfrom __future__ import annotations\n\nFIX_ID = "v27.6.1d-teacher-packet-clean-id-guard-20260904"\nTEACHER_PACKET_SCHEMA = "agillm5.detachable-50m.teacher-packet.v2"\n\n\ndef install(ns):\n    if ns.get("_DET50_TEACHER_PACKET_ALL_FULLSTACK_INSTALLED"):\n        # Allow soft-reload upgrades: if an older fix_id is present, rewrap.\n        prior = ns.get("_DET50_TEACHER_PACKET_ALL_FULLSTACK_FIX_ID")\n        if prior == FIX_ID:\n            return\n    torch = ns["torch"]\n    F = ns.get("F") or torch.nn.functional\n    base_sat = ns.get("_DET50_TEACHER_PACKET_ALL_FULLSTACK_BASE_SAT") or ns[\n        "_dblock_fullstack_sat_anchor"\n    ]\n    base_nat = ns.get("_DET50_TEACHER_PACKET_ALL_FULLSTACK_BASE_NAT") or ns[\n        "_dblock_fullstack_nat_anchor"\n    ]\n    ns["_DET50_TEACHER_PACKET_ALL_FULLSTACK_BASE_SAT"] = base_sat\n    ns["_DET50_TEACHER_PACKET_ALL_FULLSTACK_BASE_NAT"] = base_nat\n\n    def _emit(args, state, step, anchor_ids, anchor_loss_mask, h, representation,\n              attempts_key, head):\n        runtime = getattr(args, "_detachable_50m_runtime", None)\n        if runtime is None or h is None or not torch.is_tensor(h):\n            return False\n        if head is None or getattr(head, "proj", None) is None:\n            return False\n        if not torch.is_tensor(anchor_ids) or anchor_ids.ndim != 2:\n            return False\n        # Fail closed on SAT/NAT full-stack captures that are not clean token IDs.\n        # In particular the parent NAT anchor forwards masked input IDs; feeding\n        # those back into the detachable NAT objective violates its clean-ID\n        # contract and caused contained RuntimeError/error_skipped events.\n        _eos_id, _active_mask_id = (int(v) for v in ns["_nat_boundary_ids"]())\n        if bool(anchor_ids.eq(_active_mask_id).any()):\n            state["det50_teacher_packet_reject_masked_ids"] = int(\n                state.get("det50_teacher_packet_reject_masked_ids", 0)\n            ) + 1\n            state.pop("_det50_teacher_packet", None)\n            return False\n        if tuple(anchor_ids.shape[:2]) != tuple(h.shape[:2]):\n            return False\n        teacher_every = max(1, int(getattr(args, "detachable_50m_teacher_every", 1) or 1))\n        # Family attempt counters are incremented inside the base anchors before\n        # return; after a successful run they are the capture index.\n        capture = int(state.get(attempts_key, 0) or 0)\n        if capture <= 0:\n            capture = int(state.get("det50_fullstack_teacher_capture_index", 0)) + 1\n            state["det50_fullstack_teacher_capture_index"] = capture\n        if capture % teacher_every:\n            return False\n        mapping = runtime.peek_mapping(args)\n        loss_mask = None\n        if anchor_loss_mask is not None and torch.is_tensor(anchor_loss_mask):\n            loss_mask = anchor_loss_mask.detach().clone()\n\n        kd_schedule = ((runtime.manifest.get("schedule") or {}).get(\n            "logit_distillation") or {})\n        teacher_logits = None\n        teacher_logit_positions = 0\n        teacher_vocab_size = int(head.proj.weight.size(0))\n        if bool(kd_schedule.get("enabled", True)):\n            teacher_logit_positions = min(\n                max(1, int(kd_schedule.get("max_tokens", 64) or 64)),\n                max(1, int(h.size(1)) - 1),\n            )\n            with torch.no_grad():\n                proj_w = head.proj.weight.detach()\n                proj_b = None if head.proj.bias is None else head.proj.bias.detach()\n                teacher_logits = F.linear(\n                    h[:, :teacher_logit_positions].detach(),\n                    proj_w,\n                    proj_b,\n                ).detach()\n            if teacher_logits.requires_grad or teacher_logits.grad_fn is not None:\n                raise RuntimeError(\n                    "detachable-50m SAT/NAT teacher logits are not stop-gradient"\n                )\n            if (\n                teacher_logits.ndim != 3\n                or int(teacher_logits.size(-1)) != teacher_vocab_size\n            ):\n                raise RuntimeError(\n                    "detachable-50m SAT/NAT teacher logits contract is invalid"\n                )\n\n        packet = {\n            "schema": TEACHER_PACKET_SCHEMA,\n            "direction": "mature_1p1b_to_detachable_50m",\n            "teacher_stop_gradient": True,\n            "teacher_representation": str(representation),\n            "dblock_step_before": int(step),\n            "expected_dblock_commit_step": int(step) + 1,\n            "teacher_capture_index": int(capture),\n            "popup_layer": int(mapping["layer"]),\n            "popup_sublayer": str(mapping["sublayer"]),\n            "popup_mode": str(mapping.get("popup_mode", "ar") or "ar"),\n            "anchor_ids": anchor_ids.detach().clone(),\n            "anchor_loss_mask": loss_mask,\n            "teacher_hidden": h.detach(),\n            "teacher_hidden_shape": [int(v) for v in h.shape],\n            "teacher_logits": teacher_logits,\n            "teacher_logits_shape": (\n                None if teacher_logits is None\n                else [int(v) for v in teacher_logits.shape]\n            ),\n            "teacher_logit_positions": int(teacher_logit_positions),\n            "teacher_logits_dtype": (\n                None if teacher_logits is None else str(teacher_logits.dtype)\n            ),\n            # Posthoc v27.6 rejects unless this is exactly True with valid logits.\n            "teacher_logits_pre_parent_commit": True,\n            "teacher_vocab_size": teacher_vocab_size,\n            "anchor_ids_sha256": ns["_dblock_tensor_sha256"](anchor_ids),\n            "fix_id": FIX_ID,\n        }\n        if packet["teacher_hidden"].requires_grad or packet["teacher_hidden"].grad_fn is not None:\n            raise RuntimeError("detachable-50m SAT/NAT teacher hidden is not stop-gradient")\n        if teacher_logits is None:\n            # Consumer cannot accept hidden-only; refuse to stash a doomed packet.\n            return False\n        state["_det50_teacher_packet"] = packet\n        return True\n\n    def sat_anchor(core, sat_h, scaler, args, ids, state, loss_mask=None,\n                   batch_diagnostics=None):\n        captured = {}\n        real_hidden = ns["_dblock_fullstack_hidden"]\n\n        def hooked(core_, input_ids, attention_mask, args_):\n            h = real_hidden(core_, input_ids, attention_mask, args_)\n            captured["h"] = h\n            captured["ids"] = input_ids\n            return h\n\n        ns["_dblock_fullstack_hidden"] = hooked\n        try:\n            out = base_sat(\n                core, sat_h, scaler, args, ids, state,\n                loss_mask=loss_mask, batch_diagnostics=batch_diagnostics,\n            )\n        finally:\n            ns["_dblock_fullstack_hidden"] = real_hidden\n        if out.get("ran") and "h" in captured:\n            emitted = _emit(\n                args, state, int(state.get("step", 0)),\n                captured["ids"], None, captured["h"],\n                "mature_fullstack_sat_final_hidden",\n                "fullstack_sat_anchor_attempts",\n                sat_h,\n            )\n            if emitted:\n                state["det50_teacher_packet_emits_sat"] = int(\n                    state.get("det50_teacher_packet_emits_sat", 0)\n                ) + 1\n        return out\n\n    def nat_anchor(core, nat_h, scaler, args, ids, state, loss_mask=None):\n        captured = {}\n        real_hidden = ns["_dblock_fullstack_hidden"]\n\n        def hooked(core_, input_ids, attention_mask, args_):\n            h = real_hidden(core_, input_ids, attention_mask, args_)\n            captured["h"] = h\n            captured["ids"] = input_ids\n            return h\n\n        ns["_dblock_fullstack_hidden"] = hooked\n        try:\n            out = base_nat(core, nat_h, scaler, args, ids, state, loss_mask=loss_mask)\n        finally:\n            ns["_dblock_fullstack_hidden"] = real_hidden\n        if out.get("ran") and "h" in captured:\n            emitted = _emit(\n                args, state, int(state.get("step", 0)),\n                captured["ids"], None, captured["h"],\n                "mature_fullstack_nat_final_hidden",\n                "fullstack_nat_anchor_attempts",\n                nat_h,\n            )\n            if emitted:\n                state["det50_teacher_packet_emits_nat"] = int(\n                    state.get("det50_teacher_packet_emits_nat", 0)\n                ) + 1\n        return out\n\n    ns["_dblock_fullstack_sat_anchor"] = sat_anchor\n    ns["_dblock_fullstack_nat_anchor"] = nat_anchor\n    ns["_DET50_TEACHER_PACKET_ALL_FULLSTACK_INSTALLED"] = True\n    ns["_DET50_TEACHER_PACKET_ALL_FULLSTACK_FIX_ID"] = FIX_ID\n    print("[detachable-50m-teacher-packet-all-fullstack] installed " + FIX_ID, flush=True)\n'
+_agillm_sf_module = _agillm_sf_types.ModuleType('det50_teacher_packet_all_fullstack_overlay')
+_agillm_sf_module.__file__ = __file__ + '#det50_teacher_packet_all_fullstack_overlay.py'
+_agillm_sf_module.__package__ = ''
+_agillm_sf_module.__dict__.update(_AGILLM_SF_SEED_BYTES=_AGILLM_SF_SEED_BYTES, _AGILLM_SF_IO=_agillm_sf_io)
+_agillm_sf_linecache.cache[_agillm_sf_module.__file__] = (len(_AGILLM_SF_SOURCE), None, _AGILLM_SF_SOURCE.splitlines(True), _agillm_sf_module.__file__)
+_agillm_sf_sys.modules['det50_teacher_packet_all_fullstack_overlay'] = _agillm_sf_module
+exec(compile(_AGILLM_SF_SOURCE, _agillm_sf_module.__file__, 'exec'), _agillm_sf_module.__dict__)
+_agillm_sf_module.install(globals())
+AGILLM_SINGLEFILE_MANIFEST = {'schema': 'agillm.live-singlefile.v1', 'source_sha256': '6d703a8a4241607a15122a202bf8ce0f5b0949598c99d81c10ec70d039b076c7', 'resource_sha256': {'sat_gate_v27_13_seed.npz': '9262ea3fc5cc7e4d3dc5d14aac125bd5459ce314cac05c3c11de45224e14dd94'}, 'modules': {'det50_multimode_v26_overlay': {'source_sha256': '5e702e37aaaa9e76061a15ce3fe6a44e67d54d0b0aaa2ca34e6d861595ddcf40', 'embedded_sha256': '5e702e37aaaa9e76061a15ce3fe6a44e67d54d0b0aaa2ca34e6d861595ddcf40'}, 'det50_posthoc_matryoshka_v27_6_overlay': {'source_sha256': '2f8e4687c7445b79803aa340c2575812bfa875e2573f75704c008f52cc971bda', 'embedded_sha256': '2f8e4687c7445b79803aa340c2575812bfa875e2573f75704c008f52cc971bda'}, 'det50_sat_gate_v27_13_overlay': {'source_sha256': 'ef9f353d529a36e727f802d8d55420418954cf62116666f7ccd7c63a686ef630', 'embedded_sha256': '2b1d128458e0e6add0e599a6583509443dba959ae5a811a309df59a5c9e762a3'}, 'det50_teacher_packet_all_fullstack_overlay': {'source_sha256': '167354827aa9c3b5035e000ce5ee0924c478044e155a0818265e509d4ff7e2d6', 'embedded_sha256': '167354827aa9c3b5035e000ce5ee0924c478044e155a0818265e509d4ff7e2d6'}}, 'behavior_change': 'Only seed resource I/O changes from sibling file to embedded bytes; training code and install order preserved.'}
+# ===== End self-contained det50 support =====
+
+# ===== Embedded direct56 learner and explicit route contract =====
+_AGILLM_DIRECT56_CORE_SOURCE = '"""Checkpointed, fail-closed CPU direct-56 teacher imitation controller.\n\nInputs are the public phase, a detached pre-decision context and strictly causal\nloss history.  The deterministic teacher target is used ONLY as a label.  A\nfrozen candidate sees 1,848 *future*, disjoint, aligned validation receipts;\nthose receipts never update the learner.  A successful checkpoint save must be\nacknowledged before the frozen candidate can receive any routing authority.\n"""\nfrom __future__ import annotations\n\nimport copy\nimport hashlib\nimport json\nimport math\nfrom collections import Counter\n\nimport torch\nfrom torch import nn\nfrom torch.nn import functional as F\n\n\nSCHEMA = "agillm44.direct56.controller.v1"\nFEATURE_SCHEMA = "logits-phase-only56;values-detached-context1280-pooled32+causal-global-loss-v1"\nTARGETS = 56\nTEACHER_HORIZON = 7392\nVALIDATION_SAMPLES = 1848\nSWEEPS = 33\nRAMP = ("canary_1_8", "canary_1_4", "canary_1_2", "learned_full")\nRAMP_DENOM = {"canary_1_8": 8, "canary_1_4": 4,\n              "canary_1_2": 2, "learned_full": 1}\n\n\ndef _digest(obj):\n    """Canonical digest including tensor values, types and shapes."""\n    h = hashlib.sha256()\n    def visit(x):\n        if isinstance(x, torch.Tensor):\n            t = x.detach().cpu().contiguous()\n            h.update(b"T" + str(t.dtype).encode())\n            h.update(json.dumps(list(t.shape)).encode())\n            h.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())\n        elif isinstance(x, dict):\n            h.update(b"D")\n            for k in sorted(x, key=str):\n                visit(str(k)); visit(x[k])\n        elif isinstance(x, (list, tuple)):\n            h.update(b"L")\n            for a in x:\n                visit(a)\n        else:\n            h.update(json.dumps(x, sort_keys=True, allow_nan=False,\n                                separators=(",", ":")).encode())\n        h.update(b";")\n    visit(obj)\n    return h.hexdigest()\n\n\ndef _finite_tree(obj):\n    if isinstance(obj, torch.Tensor):\n        return bool(torch.isfinite(obj).all())\n    if isinstance(obj, dict):\n        return all(_finite_tree(v) for v in obj.values())\n    if isinstance(obj, (list, tuple)):\n        return all(_finite_tree(v) for v in obj)\n    return not isinstance(obj, float) or math.isfinite(obj)\n\n\ndef _exact_int(value, minimum=0, maximum=None):\n    return (type(value) is int and value >= minimum and\n            (maximum is None or value <= maximum))\n\n\nclass MiniTransformer56(nn.Module):\n    """Three-token transformer; independent 56-logit and 56-value outputs."""\n    def __init__(self, hidden=32, heads=4, layers=1):\n        super().__init__()\n        self.phase = nn.Embedding(56, hidden)\n        self.context = nn.Linear(32, hidden)\n        self.history = nn.Linear(4, hidden)\n        self.token_type = nn.Parameter(torch.zeros(3, hidden))\n        layer = nn.TransformerEncoderLayer(hidden, heads, hidden * 2,\n                    dropout=0.0, activation="gelu", batch_first=True,\n                    norm_first=True)\n        self.encoder = nn.TransformerEncoder(layer, layers,\n                                             enable_nested_tensor=False)\n        self.norm = nn.LayerNorm(hidden)\n        self.logits = nn.Linear(hidden, 56)\n        self.values = nn.Linear(hidden, 56)\n\n    def forward(self, phases, contexts, histories):\n        # Separate encoder call prevents context/outcome history from affecting\n        # route logits. Public phase and its two predecessors fully determine\n        # routing, so all 56 raw routes can be replayed without counterfactuals.\n        route_tokens = torch.stack([self.phase((phases - i) % 56)\n                                    for i in range(3)], dim=1)\n        route_z = self.norm(self.encoder(route_tokens + self.token_type.unsqueeze(0))[:, 0])\n        tokens = torch.stack((self.phase(phases), self.context(contexts),\n                              self.history(histories)), dim=1)\n        encoded = self.encoder(tokens + self.token_type.unsqueeze(0))\n        z = self.norm(encoded[:, 0])\n        return self.logits(route_z), self.values(z).squeeze(-1)\n\n\ndef evaluate_gate(rows, faults=0):\n    """Evaluate exact hard gates. Bootstrap resamples whole 56-row sweeps.\n\n    The one-sided 95% bound is an explicitly approximate paired percentile\n    block-bootstrap bound (4,096 replicates, deterministic seed 5607392).\n    It is not an IID-row confidence bound or a mathematical coverage proof.\n    """\n    reasons = []\n    if len(rows) != VALIDATION_SAMPLES:\n        return {"pass": False, "blockers": ["need_exactly_1848_samples"],\n                "samples": len(rows), "faults": int(faults)}\n    required = {"clock", "teacher", "actual", "raw_prediction", "teacher_ce",\n                "value_abs_error", "baseline_abs_error", "override"}\n    for row in rows:\n        if (not isinstance(row, dict) or not required <= set(row) or\n            not _exact_int(row["clock"]) or\n            any(not _exact_int(row[k], 0, 55) for k in ("teacher", "actual", "raw_prediction")) or\n            type(row["override"]) is not bool or\n            any(type(row[k]) not in (int, float) or not math.isfinite(row[k]) or row[k] < 0\n                for k in ("teacher_ce", "value_abs_error", "baseline_abs_error"))):\n            return {"pass": False, "blockers": ["malformed_validation_receipt"],\n                    "samples": len(rows), "faults": int(faults)}\n    if [r["clock"] for r in rows] != list(range(rows[0]["clock"], rows[0]["clock"] + VALIDATION_SAMPLES)):\n        return {"pass": False, "blockers": ["validation_clocks_not_unique_contiguous"],\n                "samples": len(rows), "faults": int(faults)}\n    support = [0] * 56\n    correct = [0] * 56\n    maximum_age = 0\n    last_seen = [None] * 56\n    complete_sweeps = True\n    errors = []\n    baseline_errors = []\n    for i, row in enumerate(rows):\n        t, p = int(row["teacher"]), int(row["raw_prediction"])\n        support[t] += 1\n        correct[t] += int(t == p)\n        last_seen[p] = i\n        if i >= 55:\n            age = max((i - z if z is not None else i + 1) for z in last_seen)\n            maximum_age = max(maximum_age, age)\n        errors.append(float(row["value_abs_error"]))\n        baseline_errors.append(float(row["baseline_abs_error"]))\n    for start in range(0, len(rows), 56):\n        sweep = rows[start:start + 56]\n        if (sweep[0]["clock"] % 56 != 0 or\n            [r["clock"] for r in sweep] != list(range(sweep[0]["clock"], sweep[0]["clock"] + 56)) or\n            len({r["raw_prediction"] for r in sweep}) != 56 or\n            len({r["teacher"] for r in sweep}) != 56):\n            complete_sweeps = False\n    ce = sum(r["teacher_ce"] for r in rows) / len(rows)\n    accuracy = sum(correct) / len(rows)\n    recall = [correct[i] / support[i] if support[i] else 0.0 for i in range(56)]\n    den = sum(baseline_errors)\n    ratio = sum(errors) / den if den > 1e-12 else None\n    paired = torch.tensor(list(zip(errors, baseline_errors)), dtype=torch.float64)\n    blocks = paired.reshape(SWEEPS, 56, 2).sum(dim=1)\n    rng = torch.Generator(device="cpu").manual_seed(5607392)\n    idx = torch.randint(SWEEPS, (4096, SWEEPS), generator=rng)\n    boot = blocks[idx].sum(dim=1)\n    valid = boot[:, 1] > 1e-12\n    ucb = None\n    if bool(valid.all()):\n        ucb = float(torch.quantile(boot[:, 0] / boot[:, 1], 0.95))\n    override_rate = sum(bool(r["override"]) for r in rows) / len(rows)\n    if ce > 0.05: reasons.append("teacher_ce_gt_0.05")\n    if accuracy < 0.995: reasons.append("top1_lt_0.995")\n    if min(support) < 33: reasons.append("per_target_support_lt_33")\n    if min(recall) < 0.95: reasons.append("per_target_recall_lt_0.95")\n    if ratio is None or ratio > 0.85: reasons.append("value_mae_ratio_gt_0.85_or_undefined")\n    if ucb is None or ucb > 0.90: reasons.append("value_mae_ratio_ucb_gt_0.90_or_undefined")\n    if not complete_sweeps: reasons.append("aligned56_raw_free_run_not_unique")\n    if maximum_age > 112: reasons.append("raw_maximum_target_age_gt_112")\n    if override_rate > 0.05: reasons.append("overrides_gt_5_percent")\n    if faults: reasons.append("nonzero_fault_ledger")\n    if not _finite_tree(rows): reasons.append("nonfinite_validation")\n    return {"pass": not reasons, "blockers": reasons, "samples": len(rows),\n            "frozen_cycles": 3, "samples_per_cycle": 616,\n            "complete_aligned_sweeps": SWEEPS if complete_sweeps else 0,\n            "teacher_ce": ce, "top1": accuracy, "support": support,\n            "recall": recall, "value_mae_ratio": ratio,\n            "value_mae_ratio_one_sided_95_ucb": ucb,\n            "ucb_method": "paired-56-sweep-percentile-bootstrap-4096-seed5607392",\n            "ucb_coverage": "approximate", "raw_aligned56_unique": complete_sweeps,\n            "raw_maximum_target_age": maximum_age,\n            "overrides": override_rate, "faults": int(faults)}\n\n\nclass Direct56Controller:\n    def __init__(self, origin_clock, binding, config=None):\n        self.config = {"hidden": 32, "heads": 4, "layers": 1,\n                       "learning_rate": 0.002, "value_weight": 0.1,\n                       "replay_batch": 56, "replay_capacity": 448,\n                       "update_every": 8, "seed": 5607392}\n        if config:\n            unknown = set(config) - set(self.config)\n            if unknown: raise ValueError("unsupported direct56 config: " + str(sorted(unknown)))\n            self.config.update(config)\n        if self.config["hidden"] not in (32, 64) or self.config["heads"] != 4 or self.config["layers"] not in (1, 2):\n            raise ValueError("direct56 architecture must be hidden32/64, heads4, layers1/2")\n        if any(int(self.config[k]) < 1 for k in ("replay_batch", "replay_capacity", "update_every")):\n            raise ValueError("invalid replay/update settings")\n        if int(origin_clock) != origin_clock or origin_clock < 0:\n            raise ValueError("invalid direct56 origin clock")\n        self.binding = copy.deepcopy(binding)\n        _digest(self.binding)\n        if "teacher_by_phase" in self.binding:\n            mapping = self.binding["teacher_by_phase"]\n            if not isinstance(mapping, list) or len(mapping) != 56 or any(not _exact_int(t, 0, 55) for t in mapping) or len(set(mapping)) != 56:\n                raise ValueError("direct56 binding teacher map must be an exact56 bijection")\n        self.origin_clock = int(origin_clock)\n        self.next_clock = int(origin_clock)\n        self.model = self._new_model()\n        self.optimizer = torch.optim.AdamW(self.model.parameters(),\n                               lr=float(self.config["learning_rate"]), weight_decay=0.001)\n        self.candidate = None\n        self.candidate_hash = None\n        self.candidate_persisted = False\n        self.persisted_checkpoint_step = None\n        self.stage = "teacher_training"\n        self.teacher_training_receipts = 0\n        self.lifetime_teacher_training_receipts = 0\n        self.total_commits = 0\n        self.optimizer_updates = 0\n        self.candidate_number = 0\n        self.freeze_receipt = None\n        self.freeze_clock = None\n        self.freeze_training_receipts = None\n        self.stage_receipts = 0\n        self.baseline = 0.0\n        self.loss_ema = None\n        self.loss_abs_ema = 1.0\n        self.last_loss = 0.0\n        self.rows = []\n        self.replay = []\n        self.pending = None\n        self.visited = set()\n        self.shadow_visited = set()\n        self.last_actual = [None] * 56\n        self.faults = []\n        self.last_gate = None\n        self.qualified_holdout = None\n        self.gate_history = []\n        self.last_train_metrics = None\n        self._exports = {}\n\n    def _new_model(self):\n        with torch.random.fork_rng(devices=[]):\n            # torch.manual_seed also reseeds every CUDA generator, which would\n            # alter the main trainer despite fork_rng(devices=[]). CPU only.\n            torch.random.default_generator.manual_seed(int(self.config["seed"]))\n            m = MiniTransformer56(self.config["hidden"], self.config["heads"],\n                                  self.config["layers"]).cpu().float()\n        return m\n\n    def _features(self, context):\n        x = torch.as_tensor(context).detach().to(device="cpu", dtype=torch.float32).reshape(-1)\n        if x.numel() != 1280 or not bool(torch.isfinite(x).all()):\n            raise ValueError("direct56 requires finite detached CPU context1280")\n        # Fixed bounded feature transform; no fitted statistics use future data.\n        pooled = torch.tanh(x.reshape(32, 40).mean(dim=1) / 8.0)\n        hist = torch.tensor([math.tanh((self.loss_ema or 0.0) / 10),\n                             math.tanh(self.last_loss / 10),\n                             math.tanh(self.loss_abs_ema / 10),\n                             min(self.total_commits / 7392, 1.0)], dtype=torch.float32)\n        return pooled, hist\n\n    def _record_fault(self, reason):\n        self.faults.append({"clock": self.next_clock, "reason": str(reason)[:256]})\n        self.stage = "faulted_teacher_only"\n        self.candidate_persisted = False\n\n    def abort(self, clock, reason="router_fault"):\n        if int(clock) != self.next_clock:\n            self._record_fault("abort_clock_mismatch")\n        # Recoverable optimizer retry retains the exact pending proposal.\n        if reason in ("retry", "overflow", "optimizer_not_committed", "skipped"):\n            return {"retry": True, "clock": self.next_clock, "stage": self.stage}\n        self._record_fault(reason)\n        return {"retry": False, "clock": self.next_clock, "stage": self.stage}\n\n    def consume_committed_failure(self, clock, actual_target, reason):\n        """Reconcile an already successful *main* optimizer after router failure.\n\n        Safe both before and after commit() advanced its own clock. The main\n        receipt is authoritative here; no second learner update is attempted.\n        """\n        if not _exact_int(clock) or not _exact_int(actual_target, 0, 55):\n            self._record_fault("malformed_main_commit_reconciliation")\n            raise ValueError("malformed direct56 main-commit reconciliation")\n        if self.next_clock not in (clock, clock + 1):\n            self._record_fault("nonadjacent_main_commit_reconciliation")\n            raise ValueError("nonadjacent direct56 main-commit reconciliation")\n        self._record_fault("committed_router_failure:" + str(reason))\n        self.next_clock = clock + 1\n        self.total_commits = self.next_clock - self.origin_clock\n        self.visited.add(actual_target)\n        self.last_actual[actual_target] = clock\n        self.pending = None\n        return self.status()\n\n    def _freeze(self):\n        if (self.faults or self.teacher_training_receipts < TEACHER_HORIZON or\n            self.teacher_training_receipts > self.lifetime_teacher_training_receipts or\n            self.lifetime_teacher_training_receipts > self.total_commits or self.next_clock % 56):\n            raise ValueError("direct56 cannot freeze before qualified teacher horizon/alignment")\n        self.candidate = copy.deepcopy(self.model).eval()\n        for p in self.candidate.parameters(): p.requires_grad_(False)\n        self.candidate_hash = _digest(self.candidate.state_dict())\n        self.candidate_persisted = False\n        self.qualified_holdout = None\n        self.candidate_number += 1\n        self.freeze_receipt = self.total_commits\n        self.freeze_clock = self.next_clock\n        self.freeze_training_receipts = self.teacher_training_receipts\n        self.baseline = float(self.loss_ema or 0.0)\n        self.stage = "frozen_holdout"\n        self.stage_receipts = 0\n        self.rows = []\n        self.shadow_visited = set()\n\n    def propose(self, clock, phase, context, teacher_target):\n        if not _exact_int(clock) or not _exact_int(phase, 0, 55) or not _exact_int(teacher_target, 0, 55):\n            self._record_fault("noninteger_proposal_identity")\n            raise ValueError("direct56 proposal identity must contain exact integers")\n        clock, phase, teacher_target = int(clock), int(phase), int(teacher_target)\n        if clock != self.next_clock or not 0 <= phase < 56 or not 0 <= teacher_target < 56:\n            self._record_fault("proposal_identity_mismatch")\n            raise ValueError("direct56 proposal clock/phase/target mismatch")\n        if "route_offset" in self.binding and phase != (clock + int(self.binding["route_offset"])) % 56:\n            self._record_fault("proposal_phase_offset_mismatch")\n            raise ValueError("direct56 phase/offset mismatch")\n        if "teacher_by_phase" in self.binding and self.binding["teacher_by_phase"][phase] != teacher_target:\n            self._record_fault("proposal_teacher_map_mismatch")\n            raise ValueError("direct56 teacher differs from bound phase map")\n        if self.pending:\n            p = self.pending\n            if (p["clock"], p["phase"], p["teacher"]) != (clock, phase, teacher_target):\n                self._record_fault("retry_identity_mismatch")\n                raise ValueError("direct56 retry identity mismatch")\n            return copy.deepcopy(p["record"])\n        if clock % 56 == 0:\n            self.visited.clear()\n            self.shadow_visited.clear()\n            if self.stage == "teacher_training" and self.teacher_training_receipts >= TEACHER_HORIZON and not self.faults:\n                self._freeze()\n            if self.stage == "eligible_wait_checkpoint" and self.candidate_persisted and not self.faults:\n                self.stage = "canary_1_8"\n                self.rows = []\n                self.stage_receipts = 0\n        try:\n            if self.stage == "faulted_teacher_only":\n                raise RuntimeError("existing_fault_teacher_only")\n            features, history = self._features(context)\n            selected_model = self.candidate if self.stage in (("frozen_holdout", "eligible_wait_checkpoint") + RAMP) else self.model\n            selected_model.eval()\n            with torch.no_grad():\n                logits, values = selected_model(torch.tensor([phase]), features[None], history[None])\n                logits, values = logits[0], values[0]\n                if not bool(torch.isfinite(logits).all() and torch.isfinite(values).all()):\n                    raise ValueError("nonfinite_prediction")\n                raw = int(torch.argmax(logits))\n                ce = float(F.cross_entropy(logits[None], torch.tensor([teacher_target])))\n        except Exception as exc:\n            if self.stage != "faulted_teacher_only":\n                self._record_fault("prediction:" + str(exc))\n            # Router failure must not terminate the main optimizer. A complete\n            # pending teacher receipt keeps checkpoint/retry clocks aligned.\n            features, history = torch.zeros(32), torch.zeros(4)\n            values = torch.zeros(56)\n            raw, ce = teacher_target, None\n        nominated = self.stage in RAMP and clock % RAMP_DENOM[self.stage] == 0\n        desired = raw if nominated else teacher_target\n        selected, guard_reason = desired, None\n        if selected in self.visited:\n            available = [t for t in range(56) if t not in self.visited]\n            if teacher_target in available:\n                selected = teacher_target\n            elif available:\n                selected = min(available, key=lambda t: (-1 if self.last_actual[t] is None else self.last_actual[t], t))\n            else:\n                self._record_fault("visited56_exhausted")\n                raise ValueError("direct56 exhausted aligned56 support")\n            guard_reason = "aligned56_duplicate"\n        shadow_override = raw in self.shadow_visited\n        # The baseline is the existing causal global EMA, read BEFORE this\n        # outcome. It adapts prospectively; it is never fitted on a future row.\n        baseline = float(self.loss_ema or 0.0)\n        record = {"schema": SCHEMA, "clock": clock, "phase": phase,\n                  "teacher_target": teacher_target, "selected": selected,\n                  "selected_target": selected, "raw_prediction": raw,\n                  "authority": "learned" if nominated and selected == raw else "teacher",\n                  "authority_granted": bool(nominated and selected == raw),\n                  "nominated": nominated, "stage": self.stage,\n                  "candidate_hash": self.candidate_hash,\n                  "candidate_persisted": self.candidate_persisted,\n                  "guard_override": guard_reason is not None,\n                  "override": guard_reason is not None,\n                  "reason": guard_reason or ("candidate_scheduled" if nominated else "deterministic_teacher"),\n                  "guard_reason": guard_reason, "shadow_override": shadow_override,\n                  "teacher_ce": ce, "baseline_prediction": baseline,\n                  "value_prediction": float(values[selected]),\n                  "teacher_value_prediction": float(values[teacher_target]),\n                  "teacher_training_receipts": self.teacher_training_receipts,\n                  "validation_samples": len(self.rows), "fault_count": len(self.faults)}\n        self.pending = {"clock": clock, "phase": phase, "teacher": teacher_target,\n                        "features": features.clone(), "history": history.clone(),\n                        "values": values.clone(), "record": record}\n        return copy.deepcopy(record)\n\n    def _learn(self, example):\n        self.replay.append(example)\n        self.replay = self.replay[-int(self.config["replay_capacity"]):]\n        if self.teacher_training_receipts % int(self.config["update_every"]): return\n        # Deterministic stratification across replay offsets, without RNG state.\n        n = min(len(self.replay), int(self.config["replay_batch"]))\n        indices = torch.linspace(0, len(self.replay) - 1, n).long().tolist()\n        batch = [self.replay[i] for i in indices]\n        phases = torch.tensor([r["phase"] for r in batch])\n        contexts = torch.stack([r["features"] for r in batch])\n        histories = torch.stack([r["history"] for r in batch])\n        targets = torch.tensor([r["teacher"] for r in batch])\n        actual = torch.tensor([r["actual"] for r in batch])\n        losses = torch.tensor([r["loss"] for r in batch])\n        # A failed router update must never poison the next full MAIN-model\n        # checkpoint. Keep the tiny learner\'s last finite state for rollback.\n        before_model = copy.deepcopy(self.model.state_dict())\n        before_optimizer = copy.deepcopy(self.optimizer.state_dict())\n        try:\n            self.model.train()\n            self.optimizer.zero_grad(set_to_none=True)\n            logits, values = self.model(phases, contexts, histories)\n            ce = F.cross_entropy(logits, targets)\n            value_loss = F.smooth_l1_loss(values.gather(1, actual[:, None]).squeeze(1), losses)\n            fit = ce + float(self.config["value_weight"]) * value_loss\n            if not bool(torch.isfinite(fit)):\n                raise ValueError("nonfinite_training_loss")\n            fit.backward()\n            norm = nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)\n            if not bool(torch.isfinite(norm)):\n                raise ValueError("nonfinite_gradient")\n            self.optimizer.step()\n            if not _finite_tree(self.model.state_dict()) or not _finite_tree(self.optimizer.state_dict()):\n                raise ValueError("nonfinite_optimizer_state")\n        except Exception as exc:\n            self.model.load_state_dict(before_model, strict=True)\n            self.optimizer.load_state_dict(before_optimizer)\n            self.optimizer.zero_grad(set_to_none=True)\n            self._record_fault("learner_update_rolled_back:" + str(exc))\n            return\n        self.optimizer_updates += 1\n        self.last_train_metrics = {"ce": float(ce.detach()),\n                                   "value_smooth_l1": float(value_loss.detach()),\n                                   "optimizer_updates": self.optimizer_updates}\n\n    def commit(self, clock, teacher_target, actual_target, loss_float,\n               outcome="optimizer_committed"):\n        if outcome != "optimizer_committed":\n            return self.abort(clock, "optimizer_not_committed")\n        p = self.pending\n        if (p is None or int(clock) != self.next_clock or\n            int(teacher_target) != p["teacher"] or int(actual_target) != p["record"]["selected"]):\n            self._record_fault("commit_identity_mismatch")\n            raise ValueError("direct56 committed target differs from pending receipt")\n        loss = float(loss_float)\n        if not math.isfinite(loss):\n            self._record_fault("nonfinite_committed_loss")\n            self.pending = None\n            # Physical optimizer commit still advances the ledger clock.\n            self.next_clock += 1\n            self.total_commits += 1\n            self.visited.add(int(actual_target))\n            self.last_actual[int(actual_target)] = int(clock)\n            return self.status()\n        r = p["record"]\n        actual_target = int(actual_target)\n        row = {"clock": int(clock), "teacher": int(teacher_target),\n               "actual": actual_target, "raw_prediction": r["raw_prediction"],\n               "teacher_ce": r["teacher_ce"],\n               "value_abs_error": abs(float(p["values"][actual_target]) - loss),\n               "baseline_abs_error": abs(r["baseline_prediction"] - loss),\n               "override": bool(r["guard_override"] or r["shadow_override"])}\n        old_stage = self.stage\n        self.visited.add(actual_target)\n        self.shadow_visited.add(r["raw_prediction"])\n        self.last_actual[actual_target] = int(clock)\n        self.total_commits += 1\n        self.next_clock += 1\n        self.pending = None\n        if old_stage == "frozen_holdout":\n            self.rows.append(row)\n            self.stage_receipts += 1\n            if len(self.rows) == VALIDATION_SAMPLES:\n                self._finish_gate(holdout=True)\n        elif old_stage in RAMP:\n            self.rows.append(row)\n            self.stage_receipts += 1\n            # Candidate inference remains frozen; separate learner follows only\n            # successfully observed outcomes, with no candidate replacement.\n            self.teacher_training_receipts += 1\n            self.lifetime_teacher_training_receipts += 1\n            self._learn({**{k: p[k] for k in ("phase", "features", "history", "teacher")},\n                         "actual": actual_target, "loss": loss})\n            if self._early_safety_failure():\n                pass\n            elif len(self.rows) == VALIDATION_SAMPLES:\n                self._finish_gate(holdout=False)\n        elif old_stage in ("teacher_training", "eligible_wait_checkpoint"):\n            self.teacher_training_receipts += 1\n            self.lifetime_teacher_training_receipts += 1\n            self._learn({**{k: p[k] for k in ("phase", "features", "history", "teacher")},\n                         "actual": actual_target, "loss": loss})\n        prior = self.loss_ema\n        self.loss_ema = loss if prior is None else 0.98 * prior + 0.02 * loss\n        self.loss_abs_ema = 0.98 * self.loss_abs_ema + 0.02 * abs(loss - (prior or 0.0))\n        self.last_loss = loss\n        return self.status()\n\n    def _early_safety_failure(self):\n        blockers = []\n        partial = self.rows[-((self.next_clock - 1) % 56 + 1):]\n        if len({r["raw_prediction"] for r in partial}) != len(partial):\n            blockers.append("raw_aligned56_duplicate")\n        errors = [r for r in self.rows if r["teacher"] != r["raw_prediction"]]\n        if len(errors) > 9: blockers.append("top1_gate_now_unreachable")\n        if errors and max(Counter(r["teacher"] for r in errors).values()) > 1:\n            blockers.append("per_target_recall_gate_now_unreachable")\n        if sum(r["teacher_ce"] for r in self.rows) > 0.05 * VALIDATION_SAMPLES:\n            blockers.append("teacher_ce_gate_now_unreachable")\n        if sum(r["override"] for r in self.rows) > math.floor(0.05 * VALIDATION_SAMPLES):\n            blockers.append("override_gate_now_unreachable")\n        if self.faults: blockers.append("nonzero_fault_ledger")\n        if not blockers: return False\n        self.last_gate = {"pass": False, "blockers": blockers,\n                          "samples": len(self.rows), "early_stop": True,\n                          "candidate_hash": self.candidate_hash, "stage": self.stage}\n        self.gate_history.append(copy.deepcopy(self.last_gate))\n        self.gate_history = self.gate_history[-16:]\n        self.stage = "faulted_teacher_only" if self.faults else "teacher_training"\n        self.candidate_persisted = False\n        self.candidate = None\n        self.candidate_hash = None\n        self.qualified_holdout = None\n        self.rows = []\n        self.stage_receipts = 0\n        self.teacher_training_receipts = 0\n        return True\n\n    def _finish_gate(self, holdout):\n        gate = evaluate_gate(self.rows, len(self.faults))\n        if holdout and (self.stage != "frozen_holdout" or\n                        self.freeze_training_receipts is None or self.freeze_training_receipts < TEACHER_HORIZON or\n                        self.freeze_clock is None or self.next_clock != self.freeze_clock + VALIDATION_SAMPLES or\n                        not self.rows or self.rows[0]["clock"] != self.freeze_clock or\n                        any(r["actual"] != r["teacher"] for r in self.rows)):\n            gate["pass"] = False\n            gate["blockers"].append("holdout_not_future_teacher_only_qualified_freeze")\n        gate.update({"candidate_hash": self.candidate_hash,\n                     "candidate_number": self.candidate_number,\n                     "freeze_clock": self.freeze_clock,\n                     "stage": self.stage,\n                     "baseline": "causal-global-loss-EMA-beta0.98-pre-decision",\n                     "baseline_at_candidate_freeze": self.baseline})\n        self.last_gate = gate\n        self.gate_history.append(copy.deepcopy(gate))\n        self.gate_history = self.gate_history[-16:]\n        if gate["pass"]:\n            if holdout:\n                qualification = {"rows": copy.deepcopy(self.rows),\n                                 "gate": copy.deepcopy(gate),\n                                 "candidate_hash": self.candidate_hash,\n                                 "binding": copy.deepcopy(self.binding)}\n                qualification["digest"] = _digest(qualification)\n                self.qualified_holdout = qualification\n                self.stage = "eligible_wait_checkpoint"\n                self.candidate_persisted = False\n            else:\n                i = RAMP.index(self.stage)\n                self.stage = RAMP[min(i + 1, len(RAMP) - 1)]\n                self.rows = []\n                self.stage_receipts = 0\n        else:\n            # Rejected holdouts are never later inserted into replay.\n            self.stage = "faulted_teacher_only" if self.faults else "teacher_training"\n            self.candidate_persisted = False\n            self.candidate = None\n            self.candidate_hash = None\n            self.qualified_holdout = None\n            self.rows = []\n            self.stage_receipts = 0\n            # Require another full 7,392 successful learner receipts before\n            # evaluating a new candidate on another unseen future holdout.\n            self.teacher_training_receipts = 0\n\n    def status(self):\n        return {"schema": SCHEMA, "stage": self.stage,\n                "next_clock": self.next_clock, "origin_clock": self.origin_clock,\n                "total_commits": self.total_commits,\n                "teacher_training_receipts": self.teacher_training_receipts,\n                "lifetime_teacher_training_receipts": self.lifetime_teacher_training_receipts,\n                "optimizer_updates": self.optimizer_updates,\n                "candidate_hash": self.candidate_hash,\n                "candidate_persisted": self.candidate_persisted,\n                "persisted_checkpoint_step": self.persisted_checkpoint_step,\n                "validation_samples": len(self.rows), "fault_count": len(self.faults),\n                "last_gate": copy.deepcopy(self.last_gate),\n                "last_train_metrics": copy.deepcopy(self.last_train_metrics)}\n\n    def export(self, checkpoint_step):\n        if int(checkpoint_step) != checkpoint_step or checkpoint_step < 0:\n            raise ValueError("invalid parent checkpoint step")\n        state = {k: copy.deepcopy(v) for k, v in self.__dict__.items()\n                 if k not in ("model", "optimizer", "candidate", "_exports")}\n        payload = {"schema": SCHEMA, "feature_schema": FEATURE_SCHEMA,\n                   "checkpoint_step": int(checkpoint_step), "binding": copy.deepcopy(self.binding),\n                   "config": copy.deepcopy(self.config), "state": state,\n                   "model_state": copy.deepcopy(self.model.state_dict()),\n                   "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),\n                   "candidate_state": copy.deepcopy(self.candidate.state_dict()) if self.candidate else None}\n        if not _finite_tree(payload):\n            self._record_fault("nonfinite_checkpoint_payload")\n            raise ValueError("nonfinite direct56 checkpoint payload")\n        # Sets are canonically represented by sorted lists, never pickled classes.\n        payload["state"]["visited"] = sorted(self.visited)\n        payload["state"]["shadow_visited"] = sorted(self.shadow_visited)\n        digest = _digest(payload)\n        payload["payload_digest"] = digest\n        self._exports[digest] = {"step": int(checkpoint_step),\n                                 "candidate_hash": self.candidate_hash,\n                                 "gate_pass": bool(self.last_gate and self.last_gate["pass"]),\n                                 "stage": self.stage}\n        self._exports = dict(list(self._exports.items())[-4:])\n        return payload\n\n    def mark_persisted(self, payload_digest, checkpoint_step):\n        """Call ONLY after successful parent checkpoint + sidecars publication."""\n        exported = self._exports.get(payload_digest)\n        if not exported or exported["step"] != int(checkpoint_step):\n            self._record_fault("checkpoint_ack_identity_mismatch")\n            raise ValueError("unknown direct56 successful-checkpoint acknowledgement")\n        eligible = (exported["candidate_hash"] == self.candidate_hash and\n                    exported["gate_pass"] and exported["stage"] in (("eligible_wait_checkpoint",) + RAMP) and\n                    self.stage in (("eligible_wait_checkpoint",) + RAMP) and not self.faults)\n        if eligible:\n            self.candidate_persisted = True\n            self.persisted_checkpoint_step = int(checkpoint_step)\n        return eligible\n\n    @classmethod\n    def restore(cls, payload, checkpoint_step, binding):\n        p = copy.deepcopy(payload)\n        claimed = p.pop("payload_digest", None)\n        if p.get("schema") != SCHEMA or p.get("feature_schema") != FEATURE_SCHEMA or claimed != _digest(p):\n            raise ValueError("direct56 checkpoint digest/schema mismatch")\n        if p["checkpoint_step"] != int(checkpoint_step) or p["binding"] != binding:\n            raise ValueError("direct56 checkpoint parent/binding mismatch")\n        if not _finite_tree(p): raise ValueError("nonfinite direct56 checkpoint")\n        c = cls(p["state"]["origin_clock"], binding, p["config"])\n        allowed_state = set(c.__dict__) - {"model", "optimizer", "candidate", "_exports"}\n        if set(p["state"]) != allowed_state:\n            raise ValueError("direct56 checkpoint state schema mismatch")\n        c.model.load_state_dict(p["model_state"], strict=True)\n        c.optimizer.load_state_dict(p["optimizer_state"])\n        for k, v in p["state"].items():\n            setattr(c, k, copy.deepcopy(v))\n        c.visited = set(c.visited)\n        c.shadow_visited = set(c.shadow_visited)\n        if c.stage not in (("teacher_training", "frozen_holdout", "eligible_wait_checkpoint", "faulted_teacher_only") + RAMP):\n            raise ValueError("invalid direct56 restored stage")\n        if any(not _exact_int(getattr(c, k)) for k in\n               ("origin_clock", "next_clock", "total_commits", "teacher_training_receipts",\n                "lifetime_teacher_training_receipts", "optimizer_updates", "candidate_number", "stage_receipts")):\n            raise ValueError("invalid direct56 restored counters")\n        if c.binding != binding or c.next_clock != c.origin_clock + c.total_commits:\n            raise ValueError("direct56 internal checkpoint identity mismatch")\n        if c.config != p["config"] or c.teacher_training_receipts > c.lifetime_teacher_training_receipts or c.lifetime_teacher_training_receipts > c.total_commits:\n            raise ValueError("direct56 internal checkpoint config/count mismatch")\n        if c.pending is not None:\n            pending = c.pending\n            if (not isinstance(pending, dict) or\n                set(pending) != {"clock", "phase", "teacher", "features", "history", "values", "record"} or\n                pending["clock"] != c.next_clock or not _exact_int(pending["phase"], 0, 55) or\n                not _exact_int(pending["teacher"], 0, 55) or\n                any(not isinstance(pending[k], torch.Tensor) or tuple(pending[k].shape) != shape\n                    for k, shape in (("features", (32,)), ("history", (4,)), ("values", (56,))))):\n                raise ValueError("direct56 pending checkpoint features/clock mismatch")\n            record = pending["record"]\n            if (not isinstance(record, dict) or record.get("schema") != SCHEMA or\n                record.get("clock") != c.next_clock or record.get("phase") != pending["phase"] or\n                record.get("teacher_target") != pending["teacher"] or\n                not _exact_int(record.get("selected_target"), 0, 55) or\n                record.get("selected") != record["selected_target"] or\n                ("route_offset" in binding and pending["phase"] != (c.next_clock + int(binding["route_offset"])) % 56) or\n                ("teacher_by_phase" in binding and pending["teacher"] != binding["teacher_by_phase"][pending["phase"]])):\n                raise ValueError("direct56 pending checkpoint proposal mismatch")\n        if p["candidate_state"] is not None:\n            c.candidate = c._new_model().eval()\n            c.candidate.load_state_dict(p["candidate_state"], strict=True)\n            for param in c.candidate.parameters(): param.requires_grad_(False)\n            if _digest(c.candidate.state_dict()) != c.candidate_hash:\n                raise ValueError("direct56 frozen candidate hash mismatch")\n        else:\n            c.candidate = None\n            if c.candidate_hash is not None: raise ValueError("missing candidate tensor state")\n        # A restored valid parent checkpoint is itself persistence evidence.\n        if c.stage in (("eligible_wait_checkpoint",) + RAMP):\n            if c.candidate is None or not c.last_gate or not c.last_gate["pass"] or c.faults:\n                raise ValueError("direct56 restored authority without passing gate")\n            q = copy.deepcopy(c.qualified_holdout)\n            if not isinstance(q, dict):\n                raise ValueError("missing direct56 holdout certificate")\n            claimed_q = q.pop("digest", None)\n            if (claimed_q != _digest(q) or q.get("candidate_hash") != c.candidate_hash or\n                q.get("binding") != binding or not evaluate_gate(q.get("rows", []), len(c.faults))["pass"]):\n                raise ValueError("invalid direct56 recomputed holdout certificate")\n            if (not _exact_int(c.freeze_clock) or c.freeze_clock % 56 or\n                not _exact_int(c.freeze_receipt) or c.freeze_clock != c.origin_clock + c.freeze_receipt or\n                not _exact_int(c.freeze_training_receipts) or c.freeze_training_receipts < TEACHER_HORIZON or\n                q["rows"][0]["clock"] != c.freeze_clock or\n                q["rows"][-1]["clock"] != c.freeze_clock + VALIDATION_SAMPLES - 1 or\n                c.next_clock < c.freeze_clock + VALIDATION_SAMPLES):\n                raise ValueError("direct56 holdout is not bound to a qualified future freeze")\n            with torch.no_grad():\n                logits, _ = c.candidate(torch.arange(56), torch.zeros(56, 32), torch.zeros(56, 4))\n                raw = torch.argmax(logits, dim=1).tolist()\n                log_probs = F.log_softmax(logits, dim=1)\n            offset = int(binding.get("route_offset", 0))\n            teacher_map = binding.get("teacher_by_phase")\n            for row in q["rows"]:\n                phase = (row["clock"] + offset) % 56\n                if (row["raw_prediction"] != raw[phase] or\n                    abs(row["teacher_ce"] + float(log_probs[phase, row["teacher"]])) > 1e-5 or\n                    (teacher_map is not None and row["teacher"] != teacher_map[phase])):\n                    raise ValueError("direct56 holdout route/CE differs from frozen candidate replay")\n            c.candidate_persisted = True\n            c.persisted_checkpoint_step = int(checkpoint_step)\n        c._exports = {}\n        return c\n'
+_AGILLM_DIRECT56_INTEGRATION_SOURCE = '"""Explicit direct-56 route contract installed into the pinned single-file trainer.\n\nThe historic XOR receipt schema is never reused to certify a learned selection.\nThe original schedule is kept as an independently reconstructable teacher.\n"""\nimport copy\nimport hashlib\nimport json\nimport math\nimport pathlib\nimport re\nfrom types import SimpleNamespace, FunctionType\n\n\nSCHEMA = "agillm43.dblock.target-route.direct56.v1"\nPOLICY = "guarded-direct56-xor-fold56-v1"\nTEACHER_POLICY = "xor-fold56-v1"\nTEACHER_SHA = "650f61343ead9636c600bf435ec9c915cd2a1ce0730cef7db27e1459d9e27ee2"\nDESCRIPTOR = {\n    "id": POLICY, "teacher_id": TEACHER_POLICY, "teacher_sha256": TEACHER_SHA,\n    "targets": 56, "teacher_training_commits": 7392,\n    "holdout_cycles": 3, "holdout_cycle_samples": 616,\n    "teacher_ce_max": 0.05, "top1_min": 0.995,\n    "support_min": 33, "target_recall_min": 0.95,\n    "value_mae_ratio_max": 0.85, "value_ratio_ucb95_max": 0.90,\n    "raw_aligned56_unique_required": True, "target_age_max": 112,\n    "override_fraction_max": 0.05, "faults_max": 0,\n    "canary_fractions": [0.125, 0.25, 0.5, 1.0],\n    "candidate_must_be_saved": True, "gradient_targets_per_commit": 1,\n}\n\n\ndef digest(value):\n    return hashlib.sha256(json.dumps(value, sort_keys=True,\n                                    separators=(",", ":"), allow_nan=False).encode()).hexdigest()\n\n\nPOLICY_SHA = digest(DESCRIPTOR)\n\n\ndef install(g, Controller):\n    """Install only in the reviewed direct56 candidate; legacy sources stay immutable."""\n    original_save = g.get("save_ckpt")\n    original_receipt = g.get("_agillm43_continuation_package_receipt")\n    original_update = g.get("_update_stats")\n    original_step = g.get("_dblock_step")\n    exact_int = g["_dblock_require_exact_int"]\n    topology = g["_dblock_target_route_topology"]\n    teacher_target = g["_dblock_xor_fold56_target"]\n    target_map = g["_dblock_target_route_target_map_sha256"]\n    source_sha = g["_dblock_target_route_controller_source_sha256"]\n    base_parent_sha = g["_DBLOCK_TARGET_ROUTE_PARENT_RUNTIME_SHA256"]\n    original_precommit = g.get("_dblock_target_route_validate_precommit")\n    legacy_globals = dict(g)\n    legacy_validate = g.get("_dblock_target_route_validate_runtime_state")\n    controller_ref = [None]\n    inverse_map = {g["_dblock_xor_fold56_coordinates"](i)["target_id"]: i\n                   for i in range(56)}\n    if set(inverse_map) != set(range(56)):\n        raise ValueError("direct56 teacher target map is not bijective")\n\n    def binding(route):\n        result = {k: route[k] for k in (\n            "controller_source_sha256", "topology_sha256", "target_map_sha256",\n            "teacher_policy_id", "teacher_policy_sha256", "route_offset",\n            "activation_parent_pointer_sha256", "activation_checkpoint_step",\n            "router_origin_clock", "migration_parent_sha256",\n        )}\n        result["teacher_by_phase"] = [g["_dblock_xor_fold56_coordinates"](i)["target_id"]\n                                      for i in range(56)]\n        return result\n\n    def selection_target(state, clock, offset, selected, selection):\n        selected = exact_int(selected, "direct56 selected target", minimum=0, maximum=55)\n        # The inverse map maps target identity to teacher phase, not to a prediction.\n        row = dict(g["_dblock_xor_fold56_coordinates"](inverse_map[selected]))\n        row.update({"route_commit_clock": clock, "route_offset": offset,\n                    "physical_layer": topology(state)["assign"][row["block"]][row["layer_offset"]],\n                    "teacher_target_id": teacher_target(state, clock, offset)["target_id"],\n                    "selection": copy.deepcopy(selection)})\n        row["target_sha256"] = digest(row)\n        return row\n\n    def validate_target(state, row, clock, offset, *, committed):\n        if not isinstance(row, dict):\n            raise ValueError("direct56 target must be an object")\n        bookkeeping = {"attempts", "first_attempt_step", "last_attempt_step"}\n        if committed:\n            bookkeeping.add("committed_step_after")\n        selection = row.get("selection")\n        if not isinstance(selection, dict):\n            raise ValueError("direct56 selection certificate missing")\n        authority = selection.get("authority")\n        if authority not in {"teacher", "learned"}:\n            raise ValueError("direct56 invalid authority")\n        if authority == "learned" and not re.fullmatch(\n                r"[0-9a-f]{64}", str(selection.get("candidate_hash") or "")):\n            raise ValueError("direct56 learned decision has no candidate binding")\n        if authority == "learned" and not selection.get("candidate_persisted"):\n            raise ValueError("direct56 learned decision was not checkpointed")\n        if selection.get("selected_target") != row.get("target_id"):\n            raise ValueError("direct56 decision/target mismatch")\n        expected = selection_target(state, clock, offset, row.get("target_id"), selection)\n        if {k: v for k, v in row.items() if k not in bookkeeping} != expected:\n            raise ValueError("direct56 target identity drift")\n        attempts = exact_int(row.get("attempts"), "direct56 attempts", minimum=1)\n        first = exact_int(row.get("first_attempt_step"), "direct56 first attempt", minimum=0)\n        last = exact_int(row.get("last_attempt_step"), "direct56 last attempt", minimum=first)\n        if last - first + 1 != attempts:\n            raise ValueError("direct56 retry counter drift")\n\n    def validate(state, args):\n        if g["_dblock_target_route_policy"](args) == "legacy":\n            return None\n        route = state.get("target_route")\n        keys = {\n            "schema", "policy_id", "policy_version", "policy_sha256",\n            "parent_runtime_sha256", "controller_source_sha256",\n            "activation_parent_pointer_sha256", "topology_sha256", "target_map_sha256",\n            "activation_checkpoint_step", "origin_committed_step", "route_offset",\n            "route_commit_clock", "route_attempt_clock", "pending_target",\n            "last_committed_target", "teacher_policy_id", "teacher_policy_sha256",\n            "router_origin_clock", "migration_parent_sha256",\n        }\n        if not isinstance(route, dict) or set(route) != keys:\n            raise ValueError("direct56 runtime schema keys mismatch")\n        fixed = {"schema": SCHEMA, "policy_id": POLICY, "policy_version": 1,\n                 "policy_sha256": POLICY_SHA, "teacher_policy_id": TEACHER_POLICY,\n                 "teacher_policy_sha256": TEACHER_SHA,\n                 "parent_runtime_sha256": base_parent_sha,\n                 "controller_source_sha256": source_sha(),\n                 "topology_sha256": digest(topology(state))}\n        for k, v in fixed.items():\n            if route[k] != v:\n                raise ValueError("direct56 runtime binding mismatch: " + k)\n        for k in ("activation_parent_pointer_sha256", "migration_parent_sha256"):\n            if not re.fullmatch(r"[0-9a-f]{64}", str(route[k])):\n                raise ValueError("direct56 invalid digest: " + k)\n        offset = exact_int(route["route_offset"], "direct56 offset", minimum=0, maximum=55)\n        if route["target_map_sha256"] != target_map(state, offset):\n            raise ValueError("direct56 teacher map mismatch")\n        origin = exact_int(route["origin_committed_step"], "direct56 origin", minimum=0)\n        clock = exact_int(route["route_commit_clock"], "direct56 clock", minimum=0)\n        attempt = exact_int(route["route_attempt_clock"], "direct56 attempts", minimum=clock)\n        exact_int(route["activation_checkpoint_step"], "direct56 original checkpoint", minimum=0)\n        exact_int(route["router_origin_clock"], "direct56 learner origin", minimum=0, maximum=clock)\n        if int(state.get("step", -1)) != origin + clock:\n            raise ValueError("direct56 semantic commit clock mismatch")\n        pending = route["pending_target"]\n        if pending is not None:\n            validate_target(state, pending, clock, offset, committed=False)\n            if pending["last_attempt_step"] != attempt - 1:\n                raise ValueError("direct56 pending attempt clock mismatch")\n            ctrl = state.get("direct56")\n            if ctrl is not None:\n                saved = getattr(ctrl, "pending", None)\n                if not isinstance(saved, dict) or saved.get("record") != pending["selection"]:\n                    raise ValueError("direct56 pending differs from bound controller decision")\n                if pending["selection"]["authority"] == "learned" and (\n                        pending["selection"]["candidate_hash"] != ctrl.candidate_hash\n                        or not ctrl.candidate_persisted):\n                    raise ValueError("direct56 pending candidate authority mismatch")\n        previous = route["last_committed_target"]\n        if clock == 0:\n            if previous is not None:\n                raise ValueError("direct56 history at clock zero")\n        else:\n            validate_target(state, previous, clock - 1, offset, committed=True)\n            if previous["committed_step_after"] != origin + clock or previous["last_attempt_step"] >= attempt:\n                raise ValueError("direct56 last commit bookkeeping mismatch")\n        return route\n\n    def route_payload(state, args, checkpoint_step):\n        route = validate(state, args)\n        if route is None:\n            return None\n        payload = {k: route[k] for k in (\n            "schema", "policy_id", "policy_version", "policy_sha256",\n            "controller_source_sha256", "activation_parent_pointer_sha256",\n            "topology_sha256", "target_map_sha256",\n        )}\n        payload.update(checkpoint_step=int(checkpoint_step), state=copy.deepcopy(route))\n        payload["sha256"] = digest(payload)\n        return payload\n\n    def boot(state, args, payload=None, checkpoint_step=0):\n        if not bool(getattr(args, "dblock_direct56_enabled", 0)):\n            raise ValueError("direct56 runtime requires explicit --dblock_direct56_enabled 1")\n        if g["_dblock_target_route_policy"](args) != "xor_fold56_v1":\n            raise ValueError("direct56 requires XOR-FOLD56 teacher")\n        for name in ("dblock_train_layers_per_update", "dblock_train_sublayers_per_update"):\n            if int(getattr(args, name, 0)) != 1:\n                raise ValueError("direct56 requires exact one-local-sublayer contract")\n        if g["_dblock_sublayer_base_mode"](args) not in {"off", "full"}:\n            raise ValueError("direct56 requires unchanged full two-layer forward")\n        if g["_dblock_router_mode"](args) != "shadow" or float(getattr(args, "dblock_router_blend", -1)) != 0.0:\n            raise ValueError("legacy 14-way router must remain non-authoritative")\n        if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:\n            raise ValueError("direct56 requires an explicitly migrated full checkpoint")\n        if payload.get("sha256") != digest({k: v for k, v in payload.items() if k != "sha256"}):\n            raise ValueError("direct56 route payload digest mismatch")\n        if payload.get("checkpoint_step") != checkpoint_step:\n            raise ValueError("direct56 checkpoint clock mismatch")\n        state["target_route"] = copy.deepcopy(payload["state"])\n        route = validate(state, args)\n        if route_payload(state, args, checkpoint_step) != payload:\n            raise ValueError("direct56 duplicate payload bindings mismatch")\n        if int(getattr(args, "dblock_target_route_offset", -1)) not in {-1, route["route_offset"]}:\n            raise ValueError("direct56 explicit offset mismatch")\n        cp = getattr(args, "_continuation_dblock_direct56_state", None)\n        if not isinstance(cp, dict):\n            raise ValueError("direct56 checkpointed learner is missing")\n        ctrl = Controller.restore(cp, checkpoint_step, binding(route))\n        state["direct56"] = ctrl\n        controller_ref[0] = ctrl\n        # Controller.restore acknowledges this package after its digest/binding checks.\n        if ctrl.next_clock != route["route_commit_clock"] or ctrl.origin_clock != route["router_origin_clock"]:\n            raise ValueError("direct56 router and route clocks differ")\n        validate(state, args)\n        print("[direct56] restored " + json.dumps({"route_clock": route["route_commit_clock"],\n              "checkpoint_step": checkpoint_step, "schema": SCHEMA, "policy": POLICY}), flush=True)\n        return route\n\n    def begin(state, args):\n        route = validate(state, args)\n        if route is None:\n            return None\n        clock, offset = route["route_commit_clock"], route["route_offset"]\n        attempt = route["route_attempt_clock"]\n        pending = route["pending_target"]\n        if pending is None:\n            teacher = teacher_target(state, clock, offset)\n            ctrl = state["direct56"]\n            decision = ctrl.propose(clock, (clock + offset) % 56,\n                                    state.get("router_ctx"), teacher["target_id"])\n            # All decision fields must be JSON; never serialize live tensors or hidden inputs.\n            decision = json.loads(json.dumps(decision, allow_nan=False))\n            chosen = decision["selected_target"]\n            pending = selection_target(state, clock, offset, chosen, decision)\n            pending.update(attempts=0, first_attempt_step=attempt, last_attempt_step=attempt)\n        pending["attempts"] += 1\n        pending["last_attempt_step"] = attempt\n        route["route_attempt_clock"] = attempt + 1\n        route["pending_target"] = pending\n        validate(state, args)\n        return copy.deepcopy(pending)\n\n    def precommit(state, args, block_idx, train_layers, train_sublayers):\n        route = validate(state, args)\n        if route is None:\n            return\n        pending = route["pending_target"]\n        if not isinstance(pending, dict):\n            raise RuntimeError("direct56 missing pending target before optimizer commit")\n        expected = {pending["physical_layer"]: pending["sublayer"]}\n        if (int(block_idx) != pending["block"] or list(train_layers) != list(expected)\n                or dict(train_sublayers) != expected):\n            raise RuntimeError("direct56 one-local-sublayer identity changed before commit")\n\n    def commit(state, args):\n        route = state["target_route"]\n        pending = route["pending_target"]\n        clock = route["route_commit_clock"]\n        if not isinstance(pending, dict) or state["step"] != route["origin_committed_step"] + clock + 1:\n            raise RuntimeError("direct56 commit must advance exactly once")\n        previous = copy.deepcopy(pending)\n        previous["committed_step_after"] = state["step"]\n        route["last_committed_target"] = previous\n        route["route_commit_clock"] = clock + 1\n        route["pending_target"] = None\n        validate(state, args)\n        # Optimizer has already committed; router failure must not roll main counters back.\n        ctrl = state["direct56"]\n        try:\n            status = ctrl.commit(clock, pending["teacher_target_id"], pending["target_id"],\n                                 float(state["last_raw_ce"]))\n            state["direct56_last_status"] = status\n        except Exception as exc:\n            ctrl.consume_committed_failure(clock, pending["target_id"],\n                                           "router_update:" + type(exc).__name__)\n            state["direct56_last_status"] = ctrl.status()\n            print("[direct56-fault] " + repr(exc), flush=True)\n            status = state["direct56_last_status"]\n        if clock % 56 == 55 or status.get("transition"):\n            print("[direct56] " + json.dumps(status, sort_keys=True, allow_nan=False), flush=True)\n\n    def emit(state, args):\n        route = validate(state, args)\n        receipt = state.get("training_science_last_receipt")\n        if not isinstance(receipt, dict):\n            raise RuntimeError("direct56 attempt receipt is absent")\n        if receipt.get("_target_route_audit_emitted"):\n            return copy.deepcopy(receipt["target_route"])\n        success = bool(receipt.get("committed", False))\n        target = route["last_committed_target"] if success else route["pending_target"]\n        if not isinstance(target, dict):\n            raise RuntimeError("direct56 attempt has no committed or pending target")\n        outcome = str(receipt.get("route_outcome") or ("optimizer_committed" if success else "rejected"))\n        if not success and any(word in outcome for word in ("nonfinite", "identity", "router", "checkpoint")):\n            state["direct56"].abort(target["route_commit_clock"], outcome)\n        event = {\n            "schema": "agillm43.dblock.target-route.direct56.receipt.v1",\n            "policy_id": POLICY, "policy_sha256": POLICY_SHA,\n            "teacher_policy_id": TEACHER_POLICY, "teacher_policy_sha256": TEACHER_SHA,\n            "controller_source_sha256": route["controller_source_sha256"],\n            "route_clock_before": target["route_commit_clock"],\n            "route_clock_after": route["route_commit_clock"],\n            "route_attempt_clock_after": route["route_attempt_clock"],\n            "route_offset": route["route_offset"],\n            "teacher_target_id": target["teacher_target_id"],\n            "target_id": target["target_id"], "target_sha256": target["target_sha256"],\n            "selection": copy.deepcopy(target["selection"]),\n            "forward_layers": list(receipt.get("forward_layers", [])),\n            "train_layers": list(receipt.get("train_layers", [])),\n            "train_sublayers": copy.deepcopy(receipt.get("train_sublayers", [])),\n            "anchors": copy.deepcopy(receipt.get("anchors", {})),\n            "committed": success, "outcome": outcome,\n            "committed_step_before": receipt.get("committed_step_before"),\n            "committed_step_after": state["step"],\n            "pending_target_after": copy.deepcopy(route["pending_target"]),\n            "committed_target": copy.deepcopy(target) if success else None,\n        }\n        receipt.update(target_route=event, _target_route_audit_emitted=True,\n                       route_clock_after=route["route_commit_clock"])\n        print("[dblock-target-route-receipt] " + json.dumps(event, sort_keys=True,\n              separators=(",", ":"), allow_nan=False), flush=True)\n        return copy.deepcopy(event)\n\n    def learner_payload(state, args, checkpoint_step):\n        validate(state, args)\n        return state["direct56"].export(int(checkpoint_step))\n\n    def save(*args, **kwargs):\n        meta = kwargs.get("meta") if "meta" in kwargs else args[7]\n        cp = meta.get("continuation_dblock_direct56_state")\n        try:\n            result = original_save(*args, **kwargs)\n        except Exception as exc:\n            ctrl = controller_ref[0]\n            if ctrl is not None:\n                ctrl.abort(ctrl.next_clock, "checkpoint_save:" + type(exc).__name__)\n            raise\n        if isinstance(cp, dict) and controller_ref[0] is not None:\n            controller_ref[0].mark_persisted(cp["payload_digest"], int(meta["step"]))\n        return result\n\n    def package_receipt(path, meta, tokenizer):\n        receipt = original_receipt(path, meta, tokenizer)\n        cp = meta.get("continuation_dblock_direct56_state")\n        if isinstance(cp, dict):\n            receipt["direct56_payload_digest"] = cp.get("payload_digest")\n            receipt["direct56_schema"] = cp.get("schema")\n            receipt["direct56_checkpointed"] = True\n        return receipt\n\n    def guarded_step(*args, **kwargs):\n        state = kwargs.get("state") if "state" in kwargs else args[8]\n        try:\n            return original_step(*args, **kwargs)\n        except Exception as exc:\n            if isinstance(state, dict) and state.get("direct56") is not None:\n                route = state.get("target_route") or {}\n                state["direct56"].abort(int(route.get("route_commit_clock", 0)),\n                                        "training_exception:" + type(exc).__name__)\n            raise\n\n    def migrate(skeleton, parent_main_sha, parent_pointer_sha, checkpoint_step):\n        for value in (parent_main_sha, parent_pointer_sha):\n            if not re.fullmatch(r"[0-9a-f]{64}", str(value)):\n                raise ValueError("direct56 migration requires hashed immutable parent")\n        if skeleton.get("step") != checkpoint_step:\n            raise ValueError("direct56 migration checkpoint clock mismatch")\n        if "continuation_dblock_direct56_state" in skeleton:\n            raise ValueError("direct56 initialization cannot overwrite an existing learner")\n        old_payload = skeleton["continuation_dblock_target_route_state"]\n        if (old_payload.get("schema") != "agillm43.dblock.target-route.xor-fold56.v2"\n                or old_payload.get("policy_id") != TEACHER_POLICY\n                or old_payload.get("policy_sha256") != TEACHER_SHA\n                or old_payload.get("checkpoint_step") != checkpoint_step\n                or old_payload.get("sha256") != digest({k: v for k, v in old_payload.items() if k != "sha256"})):\n            raise ValueError("direct56 migration parent teacher contract mismatch")\n        old = old_payload["state"]\n        if old.get("pending_target") is not None:\n            raise ValueError("direct56 migration requires a completed commit boundary")\n        expected_parent_source = "d01e0bd94f5a145fa5fcfcac0a18e2eb20e26042ce41866a1814822c068b5af3"\n        if old.get("controller_source_sha256") != expected_parent_source:\n            raise ValueError("direct56 migration source is not the reviewed frozen-CE parent")\n        for key in ("schema", "policy_id", "policy_version", "policy_sha256",\n                    "controller_source_sha256", "activation_parent_pointer_sha256",\n                    "topology_sha256", "target_map_sha256"):\n            if old_payload.get(key) != old.get(key):\n                raise ValueError("direct56 parent duplicate binding mismatch: " + key)\n        if legacy_validate is not None:\n            checked_globals = dict(legacy_globals)\n            checked_globals["_dblock_target_route_controller_source_sha256"] = lambda: expected_parent_source\n            validate_parent = FunctionType(legacy_validate.__code__, checked_globals)\n            validate_parent({"B": 14, "assign": [[2*i, 2*i+1] for i in range(14)],\n                             "step": old["origin_committed_step"] + old["route_commit_clock"],\n                             "target_route": old},\n                            SimpleNamespace(dblock_target_route_policy="xor_fold56_v1"))\n        out = copy.deepcopy(skeleton)\n        route = copy.deepcopy(old)\n        clock = int(old["route_commit_clock"])\n        route.update(schema=SCHEMA, policy_id=POLICY, policy_version=1,\n                     policy_sha256=POLICY_SHA, teacher_policy_id=TEACHER_POLICY,\n                     teacher_policy_sha256=TEACHER_SHA, controller_source_sha256=source_sha(),\n                     router_origin_clock=clock, migration_parent_sha256=parent_main_sha)\n        state = {"B": 14, "assign": [[2*i, 2*i+1] for i in range(14)],\n                 "step": int(route["origin_committed_step"]) + clock,\n                 "target_route": route}\n        if clock:\n            prev = old["last_committed_target"]\n            selected = prev["target_id"]\n            row = selection_target(state, clock-1, route["route_offset"], selected, {\n                "selected_target": selected, "authority": "teacher", "candidate_hash": None,\n                "reason": "immutable_parent_teacher_history", "override": False,\n            })\n            row.update({k: prev[k] for k in ("attempts", "first_attempt_step", "last_attempt_step", "committed_step_after")})\n            route["last_committed_target"] = row\n        synthetic_args = SimpleNamespace(dblock_target_route_policy="xor_fold56_v1")\n        validate(state, synthetic_args)\n        ctrl = Controller(clock, binding(route))\n        out["continuation_dblock_direct56_state"] = ctrl.export(checkpoint_step)\n        out["continuation_dblock_target_route_state"] = route_payload(state, synthetic_args, checkpoint_step)\n        receipt = {\n            "schema": "agillm43.runtime-source-migration.direct56.v1",\n            "checkpoint_step": checkpoint_step, "seen_tok": skeleton["seen_tok"],\n            "parent_checkpoint_sha256": parent_main_sha,\n            "parent_pointer_record_sha256": parent_pointer_sha,\n            "old_runtime_sha256": old["controller_source_sha256"],\n            "new_runtime_sha256": source_sha(),\n            "parent_route_payload_sha256": old_payload["sha256"],\n            "derived_route_payload_sha256": out["continuation_dblock_target_route_state"]["sha256"],\n            "direct56_initial_payload_digest": out["continuation_dblock_direct56_state"]["payload_digest"],\n            "teacher_origin_checkpoint_step": old["activation_checkpoint_step"],\n            "route_commit_clock": clock, "route_attempt_clock": old["route_attempt_clock"],\n            "training_steps_performed": 0, "main_model_optimizer_rng": "unchanged",\n            "new_parameters": "direct56_cpu_router_only", "initial_authority": "teacher",\n        }\n        receipt["sha256"] = digest(receipt)\n        out["direct56_source_migration"] = receipt\n        semantic = out["agillm43_semantic_migration"]\n        semantic.setdefault("runtime_continuation_migrations", []).append(copy.deepcopy(receipt))\n        return out\n\n    replacements = {\n        "_DBLOCK_TARGET_ROUTE_SCHEMA": SCHEMA,\n        "_DBLOCK_TARGET_ROUTE_POLICY_ID": POLICY,\n        "_DBLOCK_TARGET_ROUTE_POLICY_SHA256": POLICY_SHA,\n        "_dblock_target_route_validate_runtime_state": validate,\n        "_dblock_target_route_checkpoint_payload": route_payload,\n        "_dblock_target_route_boot": boot,\n        "_dblock_target_route_begin_attempt": begin,\n        "_dblock_target_route_validate_precommit": precommit,\n        "_dblock_target_route_commit": commit,\n        "_dblock_emit_target_route_receipt": emit,\n        "_dblock_direct56_checkpoint_payload": learner_payload,\n        "_direct56_migrate_checkpoint_metadata": migrate,\n        "_direct56_binding": binding,\n    }\n    if original_save:\n        replacements["save_ckpt"] = save\n    if original_receipt:\n        replacements["_agillm43_continuation_package_receipt"] = package_receipt\n    if original_step:\n        replacements["_dblock_step"] = guarded_step\n    g.update(replacements)\n'
+import types as _direct56_types
+_direct56_core_module = _direct56_types.ModuleType("agillm_direct56_core")
+_direct56_core_module.__file__ = __file__ + "#direct56_core"
+sys.modules[_direct56_core_module.__name__] = _direct56_core_module
+exec(compile(_AGILLM_DIRECT56_CORE_SOURCE, _direct56_core_module.__file__, "exec"), _direct56_core_module.__dict__)
+_direct56_integration_module = _direct56_types.ModuleType("agillm_direct56_integration")
+_direct56_integration_module.__file__ = __file__ + "#direct56_integration"
+sys.modules[_direct56_integration_module.__name__] = _direct56_integration_module
+exec(compile(_AGILLM_DIRECT56_INTEGRATION_SOURCE, _direct56_integration_module.__file__, "exec"), _direct56_integration_module.__dict__)
+_direct56_integration_module.install(globals(), _direct56_core_module.Direct56Controller)
 
 if __name__ == "__main__":
     main()
