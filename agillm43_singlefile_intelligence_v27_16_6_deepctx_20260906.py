@@ -4108,7 +4108,13 @@ def _dblock_fullstack_aux_weight(args, attr):
     )
     if requested <= 0.0:
         return 0.0
-    return min(0.10, max(0.05, float(requested)))
+    # v27.16.6: hot-configurable ceiling (default 0.10 = the reviewed band; hard cap 3.0).
+    ceiling = _dblock_hot_float(
+        args, "dblock_fullstack_aux_weight_max", 0.10,
+        names=["dblock_fullstack_aux_weight_max", "fullstack_aux_weight_max"],
+        min_value=0.10, max_value=3.0,
+    )
+    return min(float(ceiling), max(0.05, float(requested)))
 
 
 def _dblock_anchor_spike_probe(state, args, family, raw_ce):
@@ -4961,13 +4967,21 @@ def _dblock_fullstack_sat_anchor(
     row = (step + 1) % max(1, int(ids.size(0)))
     max_start = max(0, int(ids.size(1)) - seq_len)
     start = 0 if max_start == 0 else ((step * 130363 + row * 1741 + 17) % (max_start + 1))
-    anchor_ids = ids[row:row + 1, start:start + seq_len]
+    # v27.16.6: optional extra crops on other batch rows (hot int dblock_fullstack_sat_rows, default 1).
+    _sat_rows = max(1, min(int(ids.size(0)), _dblock_fullstack_anchor_int(args, "dblock_fullstack_sat_rows", 1)))
+    _rows_sel = [(row + k * 7919) % int(ids.size(0)) for k in range(_sat_rows)]
+    _starts = [start] + [
+        (0 if max_start == 0 else ((start + k * 997) % (max_start + 1))) for k in range(1, _sat_rows)
+    ]
+    anchor_ids = torch.stack([ids[r, s:s + seq_len] for r, s in zip(_rows_sel, _starts)], dim=0)
     shift = int(M.SAT_BLOCK)
     if shift != 2:
         raise RuntimeError(f"full-stack SAT anchor requires fixed shift2, got SAT_BLOCK={shift}")
     anchor_loss_mask = None
     if loss_mask is not None:
-        anchor_loss_mask = loss_mask[row:row + 1, start + shift:start + seq_len]
+        anchor_loss_mask = torch.stack(
+            [loss_mask[r, s + shift:s + seq_len] for r, s in zip(_rows_sel, _starts)], dim=0
+        )
         if not bool(anchor_loss_mask.any()):
             state["fullstack_sat_anchor_skipped_empty_mask"] = int(
                 state.get("fullstack_sat_anchor_skipped_empty_mask", 0)
@@ -4985,18 +4999,19 @@ def _dblock_fullstack_sat_anchor(
         )
         h = _dblock_fullstack_hidden(core, anchor_ids, fixed_sat_mask, args)
         hidden, targets, used, available = _sample_token_loss_inputs(
-            h[:, :-shift], anchor_ids[:, shift:], seq_len - shift, anchor_loss_mask
+            h[:, :-shift], anchor_ids[:, shift:], _sat_rows * (seq_len - shift), anchor_loss_mask
         )
         target_diagnostics = _dblock_token_boundary_diagnostics(targets)
         raw = fused_ce(hidden, sat_h.proj.weight, targets)
         gate_class_weights, gate_class_balance_source = (
             _sat_variable_gate_history_class_weights(state)
         )
+        # The SAT-variable gate keeps its single-crop supervision contract (first crop only).
         gate_loss, gate_info = _sat_variable_gate_anchor_loss(
-            sat_h, h[:, :-shift], anchor_ids[:, shift:],
+            sat_h, h[:1, :-shift], anchor_ids[:1, shift:],
             max_blocks=gate_blocks,
-            loss_mask=anchor_loss_mask,
-            token_ids=anchor_ids,
+            loss_mask=None if anchor_loss_mask is None else anchor_loss_mask[:1],
+            token_ids=anchor_ids[:1],
             boundary_token_ids=_nat_boundary_ids(),
             class_weights=gate_class_weights,
         )
@@ -5069,7 +5084,7 @@ def _dblock_fullstack_sat_anchor(
             f"gate_pred2={gate_info['predicted_stride2']} false_accepts={gate_info['false_accepts']} "
             f"gate_class_w={gate_info.get('class_weights_stride1_stride2')} "
             f"gate_balance={gate_info.get('class_balance_source')} "
-            f"crop=row{row}:{start}+{seq_len} shift={shift} finite={finite} "
+            f"crop=row{row}:{start}+{seq_len} rows={_sat_rows} shift={shift} finite={finite} "
             f"spike={spike} baseline={spike_probe.get('baseline')} softcap={softcap_probe.get('softcapped')} "
             f"cap_ce={softcap_probe.get('cap_ce')} grad_scale={softcap_probe.get('gradient_scale', 1.0):.6f} "
             f"batch_sha256={batch_diagnostics['sha256']} "
@@ -5234,8 +5249,10 @@ def _dblock_token_ids_csv_sha256(tensor):
     ).hexdigest()
 
 
-def _dblock_select_nat_anchor_crop(ids, loss_mask, seq_len, mask_id, step):
-    """Preserve a valid v10 crop; otherwise search EOS-delimited documents."""
+def _dblock_select_nat_anchor_crop(ids, loss_mask, seq_len, mask_id, step, rows=1):
+    """Preserve a valid v10 crop; otherwise search EOS-delimited documents.
+    v27.16.6: rows > 1 adds up to rows-1 further valid crops ("extra_crops"), spread through the
+    candidate list from the primary crop and preferring other batch rows."""
     if ids.ndim != 2:
         raise ValueError("full-stack NAT anchor requires rank-2 token IDs")
     if loss_mask is not None and tuple(loss_mask.shape) != tuple(ids.shape):
@@ -5383,6 +5400,38 @@ def _dblock_select_nat_anchor_crop(ids, loss_mask, seq_len, mask_id, step):
         "interval_end": int(interval_end),
         "selection_source": str(selection_source),
     }
+    extra_crops = []
+    rows = max(1, int(rows or 1))
+    if rows > 1 and total_windows > 1:
+        chosen_index = candidates.index(chosen_tuple)
+        stride = max(1, total_windows // rows)
+        order = [(chosen_index + k * stride) % total_windows for k in range(1, rows)]
+        order.extend((chosen_index + k) % total_windows for k in range(1, total_windows))
+        taken = {(int(row), int(start))}
+        taken_rows = {int(row)}
+        deferred = []
+        for index in order:
+            cand = candidates[index]
+            key = (int(cand[0]), int(cand[1]))
+            if key in taken:
+                continue
+            if int(cand[0]) in taken_rows:
+                deferred.append(cand)
+                continue
+            taken.add(key); taken_rows.add(int(cand[0]))
+            extra_crops.append({"row": int(cand[0]), "start": int(cand[1])})
+            if len(extra_crops) >= rows - 1:
+                break
+        for cand in deferred:
+            if len(extra_crops) >= rows - 1:
+                break
+            key = (int(cand[0]), int(cand[1]))
+            if key in taken:
+                continue
+            taken.add(key)
+            extra_crops.append({"row": int(cand[0]), "start": int(cand[1])})
+    chosen["extra_crops"] = extra_crops
+    chosen["rows"] = 1 + len(extra_crops)
     crop_cpu = ids_cpu[row:row + 1, start:start + seq_len]
     target_ids_cpu = crop_cpu[:, visible:]
     target_loss_cpu = (
@@ -5478,8 +5527,9 @@ def _dblock_fullstack_nat_anchor(core, nat_h, scaler, args, ids, state, loss_mas
     if vocab_size > 0 and mask_id >= vocab_size:
         raise ValueError(f"full-stack NAT anchor mask id {mask_id} outside vocab size {vocab_size}")
 
+    _nat_rows = max(1, _dblock_fullstack_anchor_int(args, "dblock_fullstack_nat_rows", 1))
     selection, diagnostics = _dblock_select_nat_anchor_crop(
-        ids, loss_mask, seq_len, mask_id, step
+        ids, loss_mask, seq_len, mask_id, step, rows=_nat_rows
     )
     state["fullstack_nat_anchor_attempts"] = int(
         state.get("fullstack_nat_anchor_attempts", 0)
@@ -5514,12 +5564,18 @@ def _dblock_fullstack_nat_anchor(core, nat_h, scaler, args, ids, state, loss_mas
 
     state["fullstack_nat_anchor_no_valid_crop_consecutive"] = 0
     row, start = int(selection["row"]), int(selection["start"])
-    clean_ids = ids[row:row + 1, start:start + seq_len]
+    # v27.16.6: primary crop first, then the extra crops (all valid single-document windows).
+    _crops = [(row, start)] + [
+        (int(e["row"]), int(e["start"])) for e in (selection.get("extra_crops") or [])
+    ]
+    clean_ids = torch.stack([ids[r, s:s + seq_len] for r, s in _crops], dim=0)
     nat_input = clean_ids.clone()
     nat_input[:, visible:] = int(mask_id)
     anchor_loss_mask = None
     if loss_mask is not None:
-        anchor_loss_mask = loss_mask[row:row + 1, start + visible:start + seq_len]
+        anchor_loss_mask = torch.stack(
+            [loss_mask[r, s + visible:s + seq_len] for r, s in _crops], dim=0
+        )
         if not bool(anchor_loss_mask.any()):
             raise RuntimeError("selected NAT document crop has no supervised target position")
 
@@ -5527,7 +5583,7 @@ def _dblock_fullstack_nat_anchor(core, nat_h, scaler, args, ids, state, loss_mas
         _dblock_clear_moe_aux_stash(core)
         h = _dblock_fullstack_hidden(core, nat_input, None, args)
         hidden, targets, used, available = _sample_token_loss_inputs(
-            h[:, visible:], clean_ids[:, visible:], seq_len - visible, anchor_loss_mask
+            h[:, visible:], clean_ids[:, visible:], len(_crops) * (seq_len - visible), anchor_loss_mask
         )
         raw = fused_ce(hidden, nat_h.proj.weight, targets)
         raw_value = float(raw.detach())
@@ -5553,8 +5609,9 @@ def _dblock_fullstack_nat_anchor(core, nat_h, scaler, args, ids, state, loss_mas
             scaler.scale(weighted).backward()
         _dblock_clear_moe_aux_stash(core)
     diagnostics["sampled_target_count"] = int(used)
+    diagnostics["rows"] = int(len(_crops))
     state["fullstack_nat_anchor_last"] = {
-        "deterministic_eval": True,
+        "deterministic_eval": True, "rows": int(len(_crops)),
         "step": step, "raw_ce": raw_value, "weighted": weighted_value,
         "uncapped_weighted": uncapped_weighted_value,
         "softcap_applied": bool(softcap_probe.get("softcapped", False)),
@@ -5572,7 +5629,7 @@ def _dblock_fullstack_nat_anchor(core, nat_h, scaler, args, ids, state, loss_mas
         print(
             f"[dblock-nat-anchor] step={step} raw_ce={raw_value:.4f} weight={weight:.4f} "
             f"weighted={weighted_value:.4f} targets={int(used)}/{int(available)} "
-            f"crop=row{row}:{start}+{seq_len} visible={visible} mask_id={mask_id} "
+            f"crop=row{row}:{start}+{seq_len} rows={len(_crops)} visible={visible} mask_id={mask_id} "
             f"crop_sha256={diagnostics['crop_sha256']} finite={finite} "
             f"spike={spike} baseline={spike_probe.get('baseline')} softcap={softcap_probe.get('softcapped')} "
             f"cap_ce={softcap_probe.get('cap_ce')} grad_scale={softcap_probe.get('gradient_scale', 1.0):.6f}",
