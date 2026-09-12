@@ -1,3 +1,26 @@
+# AGILLM4.4 live training code — snapshot 2026-09-12 (v28 variable-block SAT, sha 7782ffe1)
+
+- Verified live: 2026-09-12 08:25 UTC (vast.ai RTX 3090, instance 47086549); watchdog `agillm44_autorecover_varblock_v28.py`, supervisor PID `1823343`, trainer PID `1823480`, resumed from `pretrain_step02888381_from02877778_20260912T082342_...pt`
+- Live file: `agillm44_varblock_v28_satvar_20260912.py` (on the box: `/workspace/agillm44_varblock_v28_20260912/runtime_varblock_v28.py`)
+- SHA-256: `7782ffe1ea9f3213f0f361b2e6ca502f1e5d9c9dcb18bdc052359e65ea451e8a`
+- Size: 2,010,027 bytes
+- Lineage: `runtime_retain_activations_v2.py` (714ee71c / 989a7ee5, 2026-09-10) -> `runtime_satgate_v3_20260912.py` (d9accb92, another agent's calibrated 1-vs-2 SAT gate `SATHead.gate_conf`, 02:29 UTC -> live 01:34 UTC) -> this file, produced by `make_v28_on_satgate_v3.py` (anchored exactly-once edits on the satgate_v3 base; `python3 make_v28_on_satgate_v3.py runtime_satgate_v3_20260912.py out.py` reproduces it byte-for-byte).
+
+Owner directive (2026-09-12 01:35 UK): "SAT VAR IS NOT SAT VAR IF JUST DOING 1 TOKEN OR 2 TOKEN ONLY - IT HAS TO CHOOSE, TRAINING OBJECTIVE BALANCES SPEED AND INTELLIGENCE." What v28 changes, and nothing else:
+
+- Variable-block SAT local objective: each DBlock SAT step samples a random partition of the sequence into blocks of size 1..4 (hot key `dblock_satvar_block_probs`, default `1:0.20,2:0.40,3:0.20,4:0.20`) and uses the block-causal mask of that partition. Slot j of a block predicts the token j+1 beyond the block through `proj(h + shift_emb[j])` (`SATHead.shift_emb`, zero-initialised, so size-2 blocks reproduce the legacy fixed shift-2 objective bit-exactly and size-1 blocks are the AR objective through the SAT head).
+- Regret head `SATHead.stride_regret` (d -> 256 -> 8, bias initialised to the measured log-CE prior) regresses log E[CE_d] for d = 1..8 from the block's last hidden state, detached from the trunk; its per-distance predictions vs observed CE are logged in `[dblock-satvar]` / `[dblock-satvar-anchor]` lines and on the dashboard.
+- Full-stack variable-block anchor `_dblock_fullstack_satvar_anchor` (hot keys `dblock_fullstack_satvar_every/offset/rows/tokens/weight`; live hot config rev 34 runs it every 24 steps at offset 12, 1 row x 256 tokens, weight 0.10 — it shipped at every 3 steps, which over-weighted SAT-type full-stack gradient 2:1 against AR and coincided with a held-out regression, see receipt `change_receipt_satvar_anchor_20260912` in the hot config).
+- Two fresh tail optimizer groups `satvar_shift` (1e-4) and `satvar_regret` (3e-4), appended on resume, excluded from the cosine schedule and the LR governor; mature checkpoint optimizer indices untouched.
+- Decode `infer --mode sat --var`: `--satvar_policy auto|regret|entropy|legacy`, `--satvar_lambda` (nats traded per saved forward pass), `--satvar_kmax`, `--satvar_merge_cost` (default 0.5*lambda). Stride m* = argmax over m of lambda*(m-1) - sum_{d=2..m} max(0, CE_d - CE_1) - merge_cost*[m > last block]; growth beyond the last block re-forwards the trailing tokens as one block.
+- v28.1 (02:37 UTC): `_satvar_token_ce_nograd` runs with autocast disabled (bf16 autocast demoted the logits and the fp32 `index_put` raised on the first live SAT step).
+
+Held-out frontier measured on checkpoint 2888381 (24 windows x 224 tokens of heldout_v3, regret policy, kmax 4): lambda 0 -> 1.00 tokens/forward at CE 6.46; 0.5 -> 2.05x at 7.14; 1.0 -> 2.39x at 7.19; 2.0 -> 3.07x at 7.26; 4.0 -> 3.85x at 7.30; plain AR decode on the same tokens 5.63. Evaluator: `/workspace/satvar_vb_20260912/satvar_frontier_eval.py` on the box (results under `out_2888381/`).
+
+Everything below this line is the previous snapshot's README (2026-09-10 / 2026-09-06) and still describes the launch environment, hot-config and LR-governor history that v28 inherits unchanged.
+
+---
+
 # AGILLM4.4 live training code
 
 This standalone repository contains the exact, unmodified single-file Python trainer used by the live AGILLM4.4 production process at the verification time below.
