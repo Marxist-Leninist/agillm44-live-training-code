@@ -1,3 +1,4 @@
+# AGILLM44-SEMANTIC-REPO-SATVAR-20260911: Sakana RePo adaptation; identity NoPE retrofit; SAT-var gate remains detached.
 # AGILLM43_CHECKPOINT_PACKAGE_GC_V2 2026-08-03
 # AGILLM43_CONTINUATION_QUALITY_V16 2026-08-08
 #!/usr/bin/env python3
@@ -1492,12 +1493,46 @@ def _dblock_target_route_policy(args):
     return str(getattr(args, "dblock_target_route_policy", "legacy") or "legacy").lower()
 
 
+_AGILLM44_REPO_DIRECT56_PARENT_RUNTIME_SHA256 = (
+    "714ee71c440ba9e9699034d7ea5f1de6f73d65cc80caf9f9350cf30f11a33e28"
+)
+_AGILLM44_REPO_DIRECT56_CORE_SOURCE_SHA256 = (
+    "1fa7dd08ed7cb8030361af6e740306012b3b1916563f7be8e41735a42363f49d"
+)
+_AGILLM44_REPO_DIRECT56_INTEGRATION_SOURCE_SHA256 = (
+    "dad8ee8520c10203de2ad75fd0ce55f5568768ca880f490034b8b7fd4ca02292"
+)
+
+
 def _dblock_target_route_controller_source_sha256():
-    """Hash the controller source loaded for this process, without self-reference."""
+    """Return reviewed Direct56 identity across a RePo-only runtime change.
+
+    The mature checkpoint binds Direct56 to the pre-RePo full-runtime SHA.
+    RePo is allowed to preserve that identity only when both embedded Direct56
+    source literals remain byte-identical to the reviewed parent. Any Direct56
+    source drift fails closed instead of borrowing the parent's identity.
+    """
     global _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256
     if _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256 is None:
         source_path = pathlib.Path(__file__).resolve()
-        digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        actual_runtime = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        digest = actual_runtime
+        repo_active = str(os.environ.get("AGILLM43_REPO_ENABLED", "0") or "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if repo_active:
+            core_source = globals().get("_AGILLM_DIRECT56_CORE_SOURCE")
+            integration_source = globals().get("_AGILLM_DIRECT56_INTEGRATION_SOURCE")
+            if not isinstance(core_source, str) or not isinstance(integration_source, str):
+                raise RuntimeError("RePo Direct56 compatibility sources are unavailable")
+            core_sha = hashlib.sha256(core_source.encode("utf-8")).hexdigest()
+            integration_sha = hashlib.sha256(integration_source.encode("utf-8")).hexdigest()
+            if (core_sha != _AGILLM44_REPO_DIRECT56_CORE_SOURCE_SHA256
+                    or integration_sha != _AGILLM44_REPO_DIRECT56_INTEGRATION_SOURCE_SHA256):
+                raise RuntimeError(
+                    "RePo Direct56 compatibility check failed; refusing parent controller identity")
+            digest = _AGILLM44_REPO_DIRECT56_PARENT_RUNTIME_SHA256
+            print("[repo-direct56] preserved reviewed controller identity " + digest, flush=True)
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise RuntimeError("target-route controller source SHA-256 is invalid")
         _DBLOCK_TARGET_ROUTE_CONTROLLER_SOURCE_SHA256 = digest
@@ -12963,6 +12998,83 @@ class KVBuffer:
         return self.k[:, :, :self.length], self.v[:, :, :self.length]
 
 
+class SemanticRePo(nn.Module):
+    """AGILLM-native Sakana RePo adapter for learned per-head semantic positions.
+
+    This keeps AGILLM's causal/SAT/NAT ordering masks unchanged and uses a
+    rotary map only as the differentiable Q/K geometry function R(z).  The
+    final position-assignment matrix is zero-initialized, therefore R(0)=I and
+    retrofitting a mature NoPE checkpoint is function-preserving at activation.
+    Values are never rotated.  This is deliberately an AGILLM adaptation of
+    RePo, not a claim that AGILLM historically used RoPE.
+    """
+    SCHEMA = "agillm44.semantic-repo.v1"
+
+    def __init__(self, d: int, heads: int, qk_dim: int,
+                 bottleneck: int = 0, theta: float = 500000.0):
+        super().__init__()
+        d, heads, qk_dim = int(d), int(heads), int(qk_dim)
+        if min(d, heads, qk_dim) <= 0:
+            raise ValueError("RePo dimensions must be positive")
+        p = int(bottleneck or max(1, d // 8))
+        if p <= 0:
+            raise ValueError("RePo bottleneck must be positive")
+        theta = float(theta)
+        if not math.isfinite(theta) or theta <= 1.0:
+            raise ValueError("RePo theta must be finite and > 1")
+        self.d = d
+        self.heads = heads
+        self.qk_dim = qk_dim
+        self.bottleneck = p
+        self.gate = nn.Linear(d, p, bias=False)
+        self.content = nn.Linear(d, p, bias=False)
+        self.assign = nn.Linear(p, heads, bias=False)
+        # Exact NoPE identity at retrofit.  Unlike a second scalar zero gate,
+        # this still gives assign.weight a gradient on the very first update.
+        nn.init.zeros_(self.assign.weight)
+        pairs = qk_dim // 2
+        freq = theta ** (
+            -torch.arange(pairs, dtype=torch.float32) * (2.0 / float(qk_dim))
+        )
+        self.register_buffer("frequencies", freq, persistent=True)
+        self.register_buffer("theta", torch.tensor(theta, dtype=torch.float32), persistent=True)
+
+    def positions(self, hidden: torch.Tensor) -> torch.Tensor:
+        # Sakana SEXMH form: Wz[SiLU(Wg h) * (Wc h)], independently per head.
+        return self.assign(
+            F.silu(self.gate(hidden)) * self.content(hidden)
+        ).transpose(1, 2)
+
+    def forward(self, hidden: torch.Tensor, q: torch.Tensor,
+                k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if q.shape != k.shape or q.size(-1) != self.qk_dim:
+            raise ValueError(
+                f"RePo Q/K mismatch q={tuple(q.shape)} k={tuple(k.shape)} "
+                f"expected_last={self.qk_dim}")
+        if q.size(1) != self.heads or hidden.size(0) != q.size(0) or hidden.size(1) != q.size(2):
+            raise ValueError("RePo hidden/Q/K batch-head-sequence mismatch")
+        if self.frequencies.numel() == 0:
+            return q, k
+        z = self.positions(hidden)
+        work_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+        angle = z.to(work_dtype).unsqueeze(-1) * self.frequencies.to(
+            device=q.device, dtype=work_dtype).view(1, 1, 1, -1)
+        c = angle.cos().to(dtype=q.dtype)
+        s = angle.sin().to(dtype=q.dtype)
+        n = int(2 * self.frequencies.numel())
+
+        def rotate(value: torch.Tensor) -> torch.Tensor:
+            even = value[..., :n:2]
+            odd = value[..., 1:n:2]
+            pair = torch.stack((even * c - odd * s,
+                                even * s + odd * c), dim=-1).flatten(-2)
+            # Odd score widths retain the final scalar unchanged.
+            return torch.cat((pair, value[..., n:]), dim=-1) if n < value.size(-1) else pair
+
+        # Out-of-place rotation is required for tie_kv: V must remain unrotated.
+        return rotate(q), rotate(k)
+
+
 class TuneableAttentionMHA(nn.Module):
     def __init__(
         self,
@@ -12979,6 +13091,9 @@ class TuneableAttentionMHA(nn.Module):
         sublinear_recent_anchors: int = DEFAULT_SUBLINEAR_RECENT_ANCHORS,
         sublinear_pooled_landmarks: bool = DEFAULT_SUBLINEAR_POOLED_LANDMARKS,
         tie_kv: bool = False,
+        repo_enabled: bool = False,
+        repo_dim: int = 0,
+        repo_theta: float = 500000.0,
     ):
         super().__init__()
         assert d % h == 0
@@ -13007,6 +13122,12 @@ class TuneableAttentionMHA(nn.Module):
         nn.init.orthogonal_(self.U)
         self.proj = nn.Linear(h * self.dk, d, bias=False)
         self.drop = nn.Dropout(0.1)
+        self.repo = (
+            SemanticRePo(d, h, self.dk if self.r > self.dk else self.r,
+                         bottleneck=int(repo_dim or max(1, d // 8)),
+                         theta=float(repo_theta))
+            if bool(repo_enabled) else None
+        )
         # Exact n1 harvest: for expansion ranks, (q @ U) @ (k @ U).T is
         # q @ (U @ U.T) @ k.T. This keeps score/cache width at d_k with no
         # quality change. Inference caches the metric and training recomputes
@@ -13220,6 +13341,8 @@ class TuneableAttentionMHA(nn.Module):
             q = self._proj_qk(q_lin)
             k_new = self._proj_qk(k_lin)
             v_new = self._reshape_v(v_lin)
+        if self.repo is not None:
+            q, k_new = self.repo(x, q, k_new)
         if kv_cache is None:
             k, v = k_new, v_new
         elif isinstance(kv_cache, KVBuffer):
@@ -13471,6 +13594,9 @@ class Block(nn.Module):
         moe_shared_experts: int = 0,
         moe_shared_mlp_mult: int = 0,
         tie_kv: bool = False,
+        repo_enabled: bool = False,
+        repo_dim: int = 0,
+        repo_theta: float = 500000.0,
     ):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
@@ -13487,6 +13613,9 @@ class Block(nn.Module):
             sublinear_recent_anchors=sublinear_recent_anchors,
             sublinear_pooled_landmarks=sublinear_pooled_landmarks,
             tie_kv=tie_kv,
+            repo_enabled=repo_enabled,
+            repo_dim=repo_dim,
+            repo_theta=repo_theta,
         )
         self.ff = (
             MoEFFN(d, mlp_mult=moe_mlp_mult, experts=moe_experts, top_k=moe_top_k,
@@ -13619,10 +13748,62 @@ def _hc_reconcile_state_dict(sd, core):
     return sd
 
 
+def _repo_state_keys(sd: dict) -> List[str]:
+    if not isinstance(sd, dict):
+        return []
+    return [k for k in sd if isinstance(k, str) and ".mha.repo." in k]
+
+
+def _repo_checkpoint_config(sd: dict) -> dict:
+    """Infer the minimal RePo topology required to instantiate a saved core."""
+    keys = _repo_state_keys(sd)
+    if not keys:
+        return {"enabled": False, "start_layer": -1, "dim": 0}
+    layers = []
+    dim = 0
+    for key in keys:
+        parts = key.split(".")
+        if len(parts) >= 5 and parts[0] == "blocks" and parts[1].isdigit():
+            layers.append(int(parts[1]))
+        if key.endswith(".mha.repo.gate.weight") and torch.is_tensor(sd.get(key)):
+            dim = int(sd[key].shape[0])
+    if not layers or dim <= 0:
+        raise ValueError("checkpoint RePo state is incomplete or malformed")
+    active = sorted(set(layers))
+    if active != list(range(active[0], active[-1] + 1)):
+        raise ValueError(f"checkpoint RePo layers are not contiguous: {active}")
+    return {"enabled": True, "start_layer": int(active[0]), "dim": int(dim)}
+
+
+def _repo_reconcile_state_dict(sd: dict, core: nn.Module) -> dict:
+    """Function-preserving migration between mature NoPE and RePo cores."""
+    if not isinstance(sd, dict):
+        return sd
+    target = core.state_dict()
+    target_keys = _repo_state_keys(target)
+    source_keys = _repo_state_keys(sd)
+    if target_keys and not source_keys:
+        out = dict(sd)
+        for key in target_keys:
+            out[key] = target[key].detach().clone()
+        print(f"[repo] RETROFIT: checkpoint predates RePo; {len(target_keys)} repo tensors "
+              "use identity-output initialization", flush=True)
+        return out
+    if source_keys and not target_keys:
+        raise RuntimeError(
+            "checkpoint contains RePo weights but this launch disabled RePo; "
+            "relaunch with --repo (and --repo_retrofit only for a NoPE source)")
+    return sd
+
+
+
 def _hc_adapt_opt_state(opt, opt_state):
-    """Append synthetic fresh param-group(s) for hc params when resuming an
-    optimizer state saved before the retrofit. hc groups are registered LAST,
-    so existing global param indices are unchanged."""
+    """Append fresh function-preserving extension groups on exact resume.
+
+    Existing global parameter indices remain unchanged because HC and RePo are
+    excluded from the historical core group and registered only at the tail.
+    PyTorch permits a newly appended group to begin without moment state.
+    """
     try:
         if not isinstance(opt_state, dict):
             return opt_state
@@ -13630,30 +13811,40 @@ def _hc_adapt_opt_state(opt, opt_state):
         if not isinstance(pgs, list):
             return opt_state
         cur_groups = opt.param_groups
-        hc_idx = [i for i, g in enumerate(cur_groups)
-                  if str(g.get("agillm43_role") or "") == "hc_core"]
-        if not hc_idx or len(pgs) != len(cur_groups) - len(hc_idx):
+        if len(pgs) >= len(cur_groups):
+            return opt_state
+        # Old groups must be an exact role-prefix.  Only known function-preserving
+        # retrofit roles may be missing from the saved tail.
+        for idx, old in enumerate(pgs):
+            old_role = str(old.get("agillm43_role") or "")
+            cur_role = str(cur_groups[idx].get("agillm43_role") or "")
+            if old_role != cur_role:
+                return opt_state
+        missing = list(range(len(pgs), len(cur_groups)))
+        allowed = {"hc_core", "repo_core"}
+        if any(str(cur_groups[i].get("agillm43_role") or "") not in allowed for i in missing):
             return opt_state
         out = copy.deepcopy(opt_state)
         next_idx = 0
-        for g in out["param_groups"]:
-            for i in g.get("params", []):
-                next_idx = max(next_idx, int(i) + 1)
-        for gi in hc_idx:
+        for group in out["param_groups"]:
+            for param_idx in group.get("params", []):
+                next_idx = max(next_idx, int(param_idx) + 1)
+        for gi in missing:
+            role = str(cur_groups[gi].get("agillm43_role") or "")
             n_new = len(cur_groups[gi]["params"])
             synth = {k: copy.deepcopy(v) for k, v in out["param_groups"][0].items()
                      if k != "params"}
             synth["params"] = list(range(next_idx, next_idx + n_new))
             synth["lr"] = float(cur_groups[gi].get("lr", synth.get("lr", 0.0)))
             synth["base_lr"] = float(cur_groups[gi].get("base_lr", synth["lr"]))
-            synth["agillm43_role"] = "hc_core"
+            synth["agillm43_role"] = role
             out["param_groups"].append(synth)
             next_idx += n_new
-        print(f"[hc] optimizer retrofit: appended {len(hc_idx)} fresh hc "
-              f"param-group(s) to the checkpoint optimizer state", flush=True)
+        print(f"[resume] appended fresh extension optimizer groups: "
+              f"{[str(cur_groups[i].get('agillm43_role') or '') for i in missing]}", flush=True)
         return out
     except Exception as exc:
-        print(f"[hc] optimizer retrofit adapter skipped ({type(exc).__name__}: {exc})", flush=True)
+        print(f"[resume] extension optimizer adapter skipped ({type(exc).__name__}: {exc})", flush=True)
         return opt_state
 
 
@@ -13685,6 +13876,10 @@ class Encoder(nn.Module):
         hc_streams: int = 0,
         hc_dblocks: int = 0,
         hc_res: str = "identity",
+        repo_enabled: bool = False,
+        repo_start_layer: int = -1,
+        repo_dim: int = 0,
+        repo_theta: float = 500000.0,
     ):
         super().__init__()
         d, l, h, r = cfg["d"], cfg["layers"], cfg["heads"], cfg["rank"]
@@ -13707,6 +13902,14 @@ class Encoder(nn.Module):
             moe_shared_mlp_mult = int(cfg.get("moe_shared_mlp_mult", 0))
         moe_shared_experts = max(0, int(moe_shared_experts))
         self.emb = nn.Embedding(VOCAB, d)
+        self.repo_enabled = bool(repo_enabled)
+        self.repo_start_layer = (
+            max(0, ((int(l) + 2) // 3) - 1)
+            if int(repo_start_layer) < 0
+            else min(max(0, int(repo_start_layer)), max(0, int(l) - 1))
+        )
+        self.repo_dim = int(repo_dim or max(1, int(d) // 8))
+        self.repo_theta = float(repo_theta)
         self.blocks = nn.ModuleList([
             Block(
                 d,
@@ -13727,8 +13930,11 @@ class Encoder(nn.Module):
                 moe_shared_experts=moe_shared_experts,
                 moe_shared_mlp_mult=moe_shared_mlp_mult,
                 tie_kv=bool(tie_kv),
+                repo_enabled=bool(self.repo_enabled and _layer_idx >= self.repo_start_layer),
+                repo_dim=self.repo_dim,
+                repo_theta=self.repo_theta,
             )
-            for _ in range(l)
+            for _layer_idx in range(l)
         ])
         self.ln = nn.LayerNorm(d)
         self.tie_weights = tie_weights
@@ -17549,6 +17755,7 @@ def _prepare_core_state_dict_for_load(core: nn.Module, sd: dict) -> dict:
         sd = _expand_dense_ffn_to_moe_state_dict(sd, core.state_dict())
         sd = _reconcile_shared_expert_keys(sd, core.state_dict())
         sd = _hc_reconcile_state_dict(sd, core)
+        sd = _repo_reconcile_state_dict(sd, core)
     return sd
 
 
@@ -24108,9 +24315,12 @@ def _optimizer_param_groups(args, core, ar_h, sat_h, lr_core: float, lr_head: fl
                 group["agillm43_role"] = str(role)
             groups.append(group)
     _hc_mod = getattr(core, "hc", None)
-    if _hc_mod is not None:
-        _hc_ids = {id(p) for p in _hc_mod.parameters()}
-        add((p for _n, p in core.named_parameters() if id(p) not in _hc_ids), lr_core, "core")
+    _hc_ids = {id(p) for p in _hc_mod.parameters()} if _hc_mod is not None else set()
+    _repo_params = [p for name, p in core.named_parameters() if ".mha.repo." in name]
+    _repo_ids = {id(p) for p in _repo_params}
+    _extension_ids = _hc_ids | _repo_ids
+    if _extension_ids:
+        add((p for _n, p in core.named_parameters() if id(p) not in _extension_ids), lr_core, "core")
     else:
         add(core.parameters(), lr_core, "core")
     add(ar_h.parameters(), lr_head, "ar_head")
@@ -24128,9 +24338,12 @@ def _optimizer_param_groups(args, core, ar_h, sat_h, lr_core: float, lr_head: fl
     if nat_h is not None:
         add(nat_h.parameters(), lr_head, "nat_head")
     if _hc_mod is not None:
-        # hc group LAST: global param indices of all pre-hc groups are unchanged,
-        # which _hc_adapt_opt_state depends on for retrofit resumes.
+        # HC stays in its historical tail position.
         add(_hc_mod.parameters(), lr_core, "hc_core")
+    if _repo_params:
+        # RePo is LAST, so a NoPE checkpoint's optimizer indices remain unchanged.
+        repo_lr = float(getattr(args, "repo_lr", 1.0e-5) or lr_core)
+        add(_repo_params, repo_lr, "repo_core")
     return groups
 
 
@@ -27217,6 +27430,23 @@ def train(args):
             print(f"[hc] hyper-connections DISABLED for this run: {_hc_reason}", flush=True)
         else:
             _hc_eff = _hc_req
+    _repo_req = bool(getattr(args, "repo", False))
+    _repo_eff = False
+    if _repo_req:
+        _repo_resume_like = bool(getattr(args, "resume", None) or getattr(args, "resume_delta", None)
+                                 or getattr(args, "warmstart_from", None))
+        if _repo_resume_like and not bool(getattr(args, "repo_retrofit", False)):
+            print("[repo] DISABLED: mature NoPE resume requires explicit --repo_retrofit", flush=True)
+        else:
+            _repo_eff = True
+    if _repo_eff:
+        _repo_start = (max(0, ((int(cfg["layers"]) + 2) // 3) - 1)
+                       if int(getattr(args, "repo_start_layer", -1)) < 0
+                       else int(getattr(args, "repo_start_layer")))
+        print(f"[repo] semantic RePo ACTIVE start_layer={_repo_start} "
+              f"dim={int(getattr(args, 'repo_dim', 0) or int(cfg['d']) // 8)} "
+              f"theta={float(getattr(args, 'repo_theta', 500000.0))} "
+              f"lr={float(getattr(args, 'repo_lr', 1.0e-5))}", flush=True)
     print(f"Config: {cfg}")
     print(
         "AGILLM4.1 single-file runtime: "
@@ -27236,6 +27466,10 @@ def train(args):
         hc_streams=_hc_eff,
         hc_dblocks=(int(getattr(args, "dblock_blocks", 0) or 0) if _hc_eff > 0 else 0),
         hc_res=str(getattr(args, "hc_res", "identity") or "identity"),
+        repo_enabled=_repo_eff,
+        repo_start_layer=int(getattr(args, "repo_start_layer", -1)),
+        repo_dim=int(getattr(args, "repo_dim", 0)),
+        repo_theta=float(getattr(args, "repo_theta", 500000.0)),
         sublinear_window=args.sublinear_window,
         sublinear_stride=args.sublinear_stride,
         sublinear_max_anchors=args.sublinear_max_anchors,
@@ -28588,6 +28822,10 @@ def _agillm43_prepare_infer_instance(args):
     old_default_dtype = torch.get_default_dtype()
     if preload_dtype is not None:
         torch.set_default_dtype(preload_dtype)
+    _repo_ckpt_cfg = _repo_checkpoint_config(sd.get("core", {}) if isinstance(sd, dict) else {})
+    if _repo_ckpt_cfg["enabled"]:
+        print(f"[repo] inference auto-detected checkpoint RePo "
+              f"start_layer={_repo_ckpt_cfg['start_layer']} dim={_repo_ckpt_cfg['dim']}", flush=True)
     try:
         with _skip_param_init():
             core = Encoder(
@@ -28605,6 +28843,10 @@ def _agillm43_prepare_infer_instance(args):
                 anchor_stride=getattr(args, "anchor_stride", DEFAULT_ANCHOR_STRIDE),
                 anchor_max=getattr(args, "anchor_max", DEFAULT_ANCHOR_MAX),
                 anchor_position=getattr(args, "anchor_position", DEFAULT_ANCHOR_POSITION),
+                repo_enabled=bool(_repo_ckpt_cfg["enabled"]),
+                repo_start_layer=int(_repo_ckpt_cfg["start_layer"]),
+                repo_dim=int(_repo_ckpt_cfg["dim"]),
+                repo_theta=500000.0,
                 **_hc_kw,
             ).to(core_device)
             print(f"[load-profile] encoder_construct={time.perf_counter() - _t_stage:.1f}s", flush=True)
@@ -30204,6 +30446,20 @@ def supervise_agillm43(args):
         "--granularity_label",
         "one-sublayer-local-grad-direct56-teacher-v27.16",
     )
+    # Semantic RePo retrofit. Candidate releases default this on; the supervisor
+    # spec also records explicit env values for auditable rollback.
+    if env_bool("AGILLM43_REPO_ENABLED", "1"):
+        template = drop_arg(template, "--no-repo", takes_value=False)
+        template = drop_arg(template, "--repo", takes_value=False)
+        template.append("--repo")
+        if env_bool("AGILLM43_REPO_RETROFIT", "1"):
+            template = drop_arg(template, "--repo_retrofit", takes_value=False)
+            template.append("--repo_retrofit")
+        template = set_arg(template, "--repo_start_layer", os.environ.get("AGILLM43_REPO_START_LAYER", "9"))
+        template = set_arg(template, "--repo_dim", os.environ.get("AGILLM43_REPO_DIM", "160"))
+        template = set_arg(template, "--repo_theta", os.environ.get("AGILLM43_REPO_THETA", "500000.0"))
+        template = set_arg(template, "--repo_lr", os.environ.get("AGILLM43_REPO_LR", "1e-5"))
+
     # v27.16 deep-context local objective; env-driven so the durable child argv
     # stays owned by the supervisor spec.  Defaults reproduce v27.15 exactly.
     template = set_arg(template, "--dblock_clean_context", os.environ.get("AGILLM43_DBLOCK_CLEAN_CONTEXT", "off"))
@@ -33264,6 +33520,18 @@ def main():
                          "start function-preserving (exactly equivalent network), optimizer keeps "
                          "old moments and adds fresh hc groups. Also required to resume hc "
                          "checkpoints when other conditions would disable hc.")
+    tr.add_argument("--repo", action=argparse.BooleanOptionalAction, default=False,
+                    help="Enable AGILLM-native semantic RePo Q/K geometry. Default off.")
+    tr.add_argument("--repo_retrofit", action="store_true",
+                    help="Explicitly allow function-preserving RePo insertion when resuming a NoPE checkpoint.")
+    tr.add_argument("--repo_start_layer", type=int, default=-1,
+                    help="Zero-based first RePo layer; -1 uses ceil(num_layers/3)-1 (paper-matched depth).")
+    tr.add_argument("--repo_dim", type=int, default=0,
+                    help="RePo SwiGLU bottleneck; 0 uses d_model/8 as in Sakana's released setup.")
+    tr.add_argument("--repo_theta", type=float, default=500000.0,
+                    help="Rotary basis theta used only as R(z), not as fixed token-index RoPE.")
+    tr.add_argument("--repo_lr", type=float, default=1.0e-5,
+                    help="Learning rate for fresh RePo parameters; isolated from mature core optimizer moments.")
     tr.add_argument("--block", type=int, default=DEFAULT_BLOCK)
     tr.add_argument("--batch_size", type=int, default=DEFAULT_BATCH)
     tr.add_argument("--source", default=DEFAULT_PRETRAIN_SOURCES)
