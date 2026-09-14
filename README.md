@@ -1,3 +1,13 @@
+# AGILLM4.4: GitHub-bound single-file trainer
+
+The canonical deployable GB10 trainer is now **`trainer/agillm44.py`**, with a SHA-256 manifest in `release.json`, automated GitHub Actions tests, and an SG-to-GB10 checkpoint-safe deployment controller. See [`deploy/README.md`](deploy/README.md) for the release workflow, operational receipts, and limitations.
+
+The initial canonical file is the exact running GB10 safe3 causal-flash source (14 September 2026), SHA-256 `f1cdfd35c66ebdc8dcc36206cb283e0ba9e2c66862aa951870ad99bdf157cf60`. Binding those bytes requires no trainer restart. It does not include the unqualified PC-ALM experiment.
+
+The material below records **historical snapshots**, not the currently selected deployment.
+
+---
+
 # AGILLM4.4 live training code — snapshot 2026-09-12 (v28 variable-block SAT, sha 7782ffe1)
 
 - Verified live: 2026-09-12 08:25 UTC (vast.ai RTX 3090, instance 47086549); watchdog `agillm44_autorecover_varblock_v28.py`, supervisor PID `1823343`, trainer PID `1823480`, resumed from `pretrain_step02888381_from02877778_20260912T082342_...pt`

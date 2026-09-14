@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.private.json
+*.log
+.env
+.env.*
+checkpoints/
+transactions/

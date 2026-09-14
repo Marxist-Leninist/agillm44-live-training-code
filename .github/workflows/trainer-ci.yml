@@ -1,0 +1,47 @@
+name: trainer-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trainer-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Compile canonical trainer
+        run: python -m py_compile trainer/agillm44.py deploy/*.py tests/test_release.py
+
+      - name: Validate release manifest and source digest
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('deploy').resolve()))
+          import release_lib
+          manifest = release_lib.validate_release(Path('.'))
+          print('qualified source:', manifest['source_sha256'])
+          PY
+
+      - name: Run checkpoint and deployment safety contracts
+        run: python -m unittest -v tests.test_release

@@ -1,0 +1,34 @@
+{
+  "schema": "agillm44.github-release.v1",
+  "source": "trainer/agillm44.py",
+  "source_sha256": "f1cdfd35c66ebdc8dcc36206cb283e0ba9e2c66862aa951870ad99bdf157cf60",
+  "parent_source_sha256": "7782ffe1ea9f3213f0f361b2e6ca502f1e5d9c9dcb18bdc052359e65ea451e8a",
+  "resume_schema": "agillm43.training.resume.v2",
+  "capabilities": [
+    "AR",
+    "dynamic-SAT-var",
+    "NAT",
+    "Direct56",
+    "exact-resume"
+  ],
+  "deployment": "checkpoint-safe",
+  "created_at_utc": "2026-09-14T22:47:00Z",
+  "live_baseline": {
+    "instance_id": 51049010,
+    "batch_size": 56,
+    "dblock_local_rows": 2,
+    "objective_loss_tokens": {
+      "ar": 8192,
+      "sat": 4096,
+      "nat": 4096
+    },
+    "sat_var": "dynamic_choose_1_or_2",
+    "causal_fastpath": true,
+    "source_sha256": "f1cdfd35c66ebdc8dcc36206cb283e0ba9e2c66862aa951870ad99bdf157cf60"
+  },
+  "performance_semantics": {
+    "nominal_heartbeat_is_not_physical_input_throughput": true,
+    "ci_performance_qualification": "none",
+    "note": "Deployment CI validates code/state safety and capability invariants. Throughput and learning quality require separate matched live measurements."
+  }
+}
