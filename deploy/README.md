@@ -41,3 +41,5 @@ GB10 controller/status/releases: `/workspace/agillm44-github-cd/`.
 Useful checks: `systemctl status agillm44-github-cd.timer`; `journalctl -u agillm44-github-cd.service -n 30`; read the SG `status.json` and the GB10 `status.json`.
 
 Pausing the deployment timer does not stop training. Checkpoints remain outside Git; existing offsite checkpoint rescue/migration is independent of this pipeline.
+
+Operational waiting receipts are explicit: `LIVE_SOURCE_DRIFT` preserves a separately launched experimental trainer; `WAITING_FOR_EXISTING_TRAINER` does not invent a cold start while another training lane is between runs. Neither means that the GitHub release is running. `BLOCKED_OR_RECOVERY_REQUIRED` carries the local reason and must not be presented as a successful deployment.

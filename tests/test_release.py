@@ -135,6 +135,15 @@ class DeploymentContracts(unittest.TestCase):
             lib.atomic_json(tx, {'phase': 'STARTED', 'checkpoint_step': 100})
             with patch.object(gpu, 'BASE', base), patch.object(gpu, 'trainers', return_value=[live]), patch.object(gpu, 'active_runtime', return_value={}), patch.object(gpu, 'wait_health', side_effect=ValueError('unhealthy')), patch.object(gpu, 'rollback_or_raise') as rollback:
                 gpu.apply(ROOT, 'a'*40); rollback.assert_called_once()
+    def test_live_source_drift_is_reported_without_stop(self):
+        live = {'pid': 123, 'source': '/experiment/agillm44.py', 'source_sha256': 'b'*64}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(gpu, 'BASE', Path(tmp)), patch.object(gpu, 'trainers', return_value=[live]), patch.object(gpu, 'graceful_stop') as stop, patch.object(gpu, 'receipt') as receipt:
+            gpu.apply(ROOT, 'a'*40)
+            stop.assert_not_called(); self.assertEqual(receipt.call_args.args[0], 'LIVE_SOURCE_DRIFT')
+    def test_no_trainer_does_not_trigger_cold_start(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(gpu, 'BASE', Path(tmp)), patch.object(gpu, 'trainers', return_value=[]), patch.object(gpu, 'launch') as launch, patch.object(gpu, 'receipt') as receipt:
+            gpu.apply(ROOT, 'a'*40)
+            launch.assert_not_called(); self.assertEqual(receipt.call_args.args[0], 'WAITING_FOR_EXISTING_TRAINER')
     def test_invalid_commit_rejected_before_deployment(self):
         with self.assertRaises(ValueError): gpu.apply(ROOT, 'main; echo invalid')
     def test_three_advances_required_for_health(self):

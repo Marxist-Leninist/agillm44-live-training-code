@@ -180,9 +180,13 @@ def apply(root: Path, commit: str) -> None:
         receipt(state, commit, source_sha256=manifest['source_sha256'], live_source=item['source'], canonical_release_source=str(source), pid=item['pid'], step=h['step'], trainer_restarted=bool(transaction), performance_qualification='NOT_MEASURED_BY_CI', training_state_modified=bool(transaction))
         return
     if transaction is None:
-        require(len(live) == 1, 'no live trainer to bind; refusing unrequested cold start')
+        if not live:
+            receipt('WAITING_FOR_EXISTING_TRAINER', commit, reason='No unrequested cold start; the existing training lane controls its launch.')
+            return
         old = live[0]
-        require(old['source_sha256'] == manifest['parent_source_sha256'], 'live code drifted from release parent; rebase the release')
+        if old['source_sha256'] != manifest['parent_source_sha256']:
+            receipt('LIVE_SOURCE_DRIFT', commit, pid=old['pid'], expected_parent_sha256=manifest['parent_source_sha256'], observed_source_sha256=old['source_sha256'], live_source=old['source'], trainer_restarted=False, reason='Rebase release on the active source; experimental/live code was not overwritten.')
+            return
         baseline = status(old)
         proc = Path('/proc') / str(old['pid'])
         env = active_runtime(old)
@@ -220,7 +224,10 @@ def main() -> None:
     args = parser.parse_args(); BASE.mkdir(parents=True, exist_ok=True)
     with (BASE / 'deploy.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        apply(args.release.resolve(), args.commit)
+        try:
+            apply(args.release.resolve(), args.commit)
+        except Exception as error:
+            receipt('BLOCKED_OR_RECOVERY_REQUIRED', args.commit, reason=str(error))
 
 if __name__ == '__main__':
     main()
