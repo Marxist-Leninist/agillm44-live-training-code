@@ -29,8 +29,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Compile canonical trainer
-        run: python -m py_compile trainer/agillm44.py deploy/*.py tests/test_release.py
+      - name: Compile canonical trainer and control plane
+        run: python -m py_compile trainer/agillm44.py deploy/*.py tests/*.py
 
       - name: Validate release manifest and source digest
         run: |
@@ -43,5 +43,5 @@ jobs:
           print('qualified source:', manifest['source_sha256'])
           PY
 
-      - name: Run checkpoint and deployment safety contracts
-        run: python -m unittest -v tests.test_release
+      - name: Run checkpoint, deployment, and transport safety contracts
+        run: python -m unittest discover -s tests -v

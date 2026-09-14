@@ -28,6 +28,32 @@ def github(endpoint: str) -> dict:
     return json.loads(run(['gh', 'api', endpoint]))
 
 
+def resolve_destination(config: dict) -> tuple[str, str]:
+    """Resolve a fresh SSH endpoint, preferably from the Vast instance id."""
+    instance_id = config.get('vast_instance_id')
+    if instance_id is None:
+        host = str(config['host']); port = str(config['port'])
+    else:
+        require(type(instance_id) is int and instance_id > 0, 'invalid Vast instance id')
+        rows = json.loads(run(['vastai', 'show', 'instances', '--raw']))
+        matches = [row for row in rows if row.get('id') == instance_id]
+        require(len(matches) == 1, 'Vast instance not found or ambiguous')
+        row = matches[0]
+        require(row.get('actual_status') == 'running' and row.get('cur_state') == 'running', 'Vast instance is not running')
+        host = str(row.get('public_ipaddr') or '')
+        port = ''
+        if host:
+            for mapping in (row.get('ports') or {}).get('22/tcp', []):
+                candidate = str(mapping.get('HostPort') or '')
+                if candidate.isdigit():
+                    port = candidate; break
+        if not host or not port:
+            host = str(row.get('ssh_host') or '')
+            port = str(row.get('ssh_port') or '')
+    require(re.fullmatch(r'[A-Za-z0-9.-]+', host) is not None and port.isdigit() and 0 < int(port) < 65536, 'invalid SSH destination')
+    return host, port
+
+
 def qualified_run(repo: str, head: str, workflow: str) -> dict | None:
     runs = github(f'repos/{repo}/actions/workflows/{workflow}/runs?branch=main&event=push&per_page=20')['workflow_runs']
     candidates = [r for r in runs if r.get('head_sha') == head and r.get('head_branch') == 'main' and r.get('event') == 'push' and r.get('path') == '.github/workflows/' + workflow and r.get('head_repository', {}).get('full_name') == repo]
@@ -56,8 +82,7 @@ def tick(config_path: Path) -> None:
         manifest = validate_release(release)
         # Recheck HEAD after downloads, never deploy a stale queued commit.
         require(github(f'repos/{repo}/git/ref/heads/main')['object']['sha'] == head, 'HEAD advanced during staging')
-        host = c['host']; port = str(c['port']); key = c['ssh_key']
-        require(re.fullmatch(r'[A-Za-z0-9.-]+', host) is not None and port.isdigit(), 'invalid SSH destination')
+        host, port = resolve_destination(c); key = c['ssh_key']
         remote = '/workspace/agillm44-github-cd/releases/' + head
         common = ['-i', key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15']
         ssh = ['ssh', *common, '-p', port, 'root@' + host]
@@ -69,7 +94,7 @@ def tick(config_path: Path) -> None:
         records = [json.loads(line) for line in output.decode().splitlines() if line.startswith('{')]
         require(bool(records), 'missing deployment receipt')
         receipt = records[-1]
-        receipt.update(ci_run_id=qualified['id'], ci_run_url=qualified['html_url'], repository=repo, source_sha256=manifest['source_sha256'], checked_epoch=time.time())
+        receipt.update(ci_run_id=qualified['id'], ci_run_url=qualified['html_url'], repository=repo, source_sha256=manifest['source_sha256'], checked_epoch=time.time(), ssh_destination_source='vast_instance_id' if c.get('vast_instance_id') is not None else 'static')
         atomic_json(root / 'status.json', receipt)
         atomic_json(root / 'receipts' / (head + '.json'), receipt)
         print(json.dumps(receipt, sort_keys=True), flush=True)
