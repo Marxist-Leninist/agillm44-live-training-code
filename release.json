@@ -2,7 +2,7 @@
   "schema": "agillm44.github-release.v1",
   "source": "trainer/agillm44.py",
   "source_sha256": "f1cdfd35c66ebdc8dcc36206cb283e0ba9e2c66862aa951870ad99bdf157cf60",
-  "parent_source_sha256": "7782ffe1ea9f3213f0f361b2e6ca502f1e5d9c9dcb18bdc052359e65ea451e8a",
+  "parent_source_sha256": "f1cdfd35c66ebdc8dcc36206cb283e0ba9e2c66862aa951870ad99bdf157cf60",
   "resume_schema": "agillm43.training.resume.v2",
   "capabilities": [
     "AR",
@@ -30,5 +30,6 @@
     "nominal_heartbeat_is_not_physical_input_throughput": true,
     "ci_performance_qualification": "none",
     "note": "Deployment CI validates code/state safety and capability invariants. Throughput and learning quality require separate matched live measurements."
-  }
+  },
+  "initial_binding": "Exact running GB10 safe3 source; no stale 3090 predecessor is accepted."
 }
