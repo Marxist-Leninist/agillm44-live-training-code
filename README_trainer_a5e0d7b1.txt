@@ -1,0 +1,6 @@
+Standard 1.1B lane — batchwoodbury_v1
+short: a5e0d7b1
+sha256: a5e0d7b1d3e58f1c3f08edd76f775db2f1aa8f6b4a656ba088b4937edb11d4b9
+bytes: 2057586
+HF: trainers/agillm44_retention4_batchwoodbury_v1_a5e0d7b1.py
+HF commit: e5161f47732d33cfa526c182f8f92b7e35a40b35
