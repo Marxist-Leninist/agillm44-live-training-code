@@ -1,0 +1,3 @@
+# Standard batchwoodbury_v1 publish 8e0d1107 (drift from a5e0d7b1; RPV 7475740d unchanged)
+8e0d1107f77f6d3350fe1c97d65f79b4abb3cd9cae357f3edd036f1662aff9f8  agillm44_retention4_batchwoodbury_v1_8e0d1107.py
+8e0d1107f77f6d3350fe1c97d65f79b4abb3cd9cae357f3edd036f1662aff9f8  agillm44_retention4_batchwoodbury_v1.py
