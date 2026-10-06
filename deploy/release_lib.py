@@ -7,6 +7,7 @@ import math
 import os
 import re
 import stat
+import tempfile
 from pathlib import Path
 
 SCHEMA = 'agillm44.github-release.v1'
@@ -24,16 +25,38 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 def atomic_json(path: Path, value: dict) -> None:
+    """Publish complete JSON on POSIX; concurrent writers are last-replace-wins.
+
+    Each call owns a unique temporary file. Failures before os.replace leave the
+    destination unchanged; a directory-fsync error after replace is propagated,
+    but the new destination is already visible. This is not a transaction lock.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + '.tmp.' + str(os.getpid()))
-    with temporary.open('w', encoding='utf-8') as stream:
-        os.chmod(temporary, 0o600)
-        json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
-        stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try: os.fsync(fd)
-    finally: os.close(fd)
+    fd, temporary_name = tempfile.mkstemp(prefix=path.name + '.tmp.', dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            stream = os.fdopen(fd, 'w', encoding='utf-8')
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
+            json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 def source_checks(path: Path) -> dict:
     require(not path.is_symlink() and path.is_file(), 'source must be a regular file')
