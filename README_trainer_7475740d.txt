@@ -1,0 +1,6 @@
+RPV/GB10 lane — exactheadlift
+short: 7475740d
+sha256: 7475740d71e78c48c118a86ff3574b1307f235a426eecba7d0e970221446ec23
+bytes: 171050
+HF: trainers/agillm_gb10_1pf.rpv16_pf2_exactheadlift_20260920_7475740d.py
+HF commit: e5161f47732d33cfa526c182f8f92b7e35a40b35
